@@ -9,7 +9,7 @@ import os
 # ==========================================
 # 1. Hyperparameters & Setup
 # ==========================================
-BATCH_SIZE = 16  # Reduced batch size for larger 256x256 images
+BATCH_SIZE = 64  # Reduced batch size for larger 256x256 images
 EPOCHS = 100     # Higher resolution needs more training
 LEARNING_RATE = 1e-4
 LATENT_DIM = 2   # Keeping it 2D for visualization compatibility
@@ -94,11 +94,11 @@ class VAE(nn.Module):
         return self.decode(z), mu, logvar
 
 def vae_loss(reconstructed_x, x, mu, logvar):
-    # Binary Cross Entropy over all pixels and channels
-    BCE = nn.functional.binary_cross_entropy(reconstructed_x, x, reduction='sum')
+    # MSE is often smoother for color image reconstruction than BCE
+    MSE = nn.functional.mse_loss(reconstructed_x, x, reduction='sum')
     # KL Divergence
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    return BCE + KLD
+    return MSE + KLD
 
 model = VAE(LATENT_DIM).to(DEVICE)
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -121,9 +121,15 @@ for epoch in range(EPOCHS):
         train_loss += loss.item()
         optimizer.step()
         
-    avg_loss = train_loss / len(dataset)
-    if (epoch + 1) % 10 == 0:
-        print(f"Epoch [{epoch+1}/{EPOCHS}] - Average Loss: {avg_loss:.4f}")
+    # Normalizing the reported loss:
+    # 1. Total loss / number of images = Avg loss per image
+    # 2. Avg loss per image / (channels * width * height) = Avg loss per pixel
+    # This brings the number down from ~100,000 to a readable range like 0.01 - 0.1
+    avg_loss_per_image = train_loss / len(dataset)
+    avg_loss_per_pixel = avg_loss_per_image / (3 * 256 * 256)
+    
+    if (epoch + 1) % 5 == 0:
+        print(f"Epoch [{epoch+1}/{EPOCHS}] - Avg Pixel MSE: {avg_loss_per_pixel:.6f}")
 
 # ==========================================
 # 5. Save Weights
