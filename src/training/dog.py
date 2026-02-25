@@ -29,6 +29,8 @@ transform = transforms.Compose([
 
 def transform_fn(examples):
     examples["pixel_values"] = [transform(image.convert("RGB")) for image in examples["image"]]
+    # Remove the original PIL images so the DataLoader doesn't try to batch them
+    del examples["image"]
     return examples
 
 dataset.set_transform(transform_fn)
