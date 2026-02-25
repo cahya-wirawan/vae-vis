@@ -6,14 +6,11 @@ import matplotlib.pyplot as plt
 
 
 # ==========================================
-# 1. Define the VAE Decoder Architecture
+# 1. Define VAE Decoder Architectures
 # ==========================================
-class SimpleDecoder(nn.Module):
-    """
-    A minimal decoder that takes a 2D latent vector (z1, z2)
-    and scales it up to a 28x28 pixel image (like MNIST).
-    """
 
+class SimpleDecoder(nn.Module):
+    """Original decoder for 28x28 grayscale MNIST."""
     def __init__(self):
         super().__init__()
         self.fc1 = nn.Linear(2, 128)
@@ -23,34 +20,31 @@ class SimpleDecoder(nn.Module):
     def forward(self, z):
         x = torch.relu(self.fc1(z))
         x = torch.relu(self.fc2(x))
-        x = torch.sigmoid(
-            self.fc3(x)
-        )  # Sigmoid pushes values between 0 and 1 (pixel intensity)
+        x = torch.sigmoid(self.fc3(x))
         return x.view(28, 28)
 
+class ConvolutionalDecoder(nn.Module):
+    """New decoder for 256x256 RGB Dog dataset."""
+    def __init__(self, latent_dim=2):
+        super().__init__()
+        self.decoder_input = nn.Linear(latent_dim, 65536)
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1), # -> 128x32x32
+            nn.ReLU(),
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),  # -> 64x64x64
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),   # -> 32x128x128
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 3, 4, stride=2, padding=1),    # -> 3x256x256
+            nn.Sigmoid()
+        )
 
-# Cache the model so the random weights stay the same as you move the sliders
-@st.cache_resource
-def load_model():
-    model = SimpleDecoder()
-    
-    # LOAD YOUR TRAINED WEIGHTS HERE
-    try:
-        model.load_state_dict(torch.load('decoder_weights.pth'))
-        st.sidebar.success("✅ Loaded trained weights!")
-    except FileNotFoundError:
-        st.sidebar.warning("⚠️ 'decoder_weights.pth' not found. Using random weights.")
-        
-    model.eval()
-    return model
-
-def load_model_simple():
-    model = SimpleDecoder()
-    model.eval()  # Set to evaluation mode
-    return model
-
-
-decoder = load_model()
+    def forward(self, z):
+        h = self.decoder_input(z)
+        h = h.view(-1, 256, 16, 16)
+        x = self.decoder(h)
+        # Returns (3, 256, 256), we want (256, 256, 3) for plotting
+        return x.squeeze(0).permute(1, 2, 0)
 
 # ==========================================
 # 2. Build the Web App Interface
@@ -58,60 +52,80 @@ decoder = load_model()
 st.set_page_config(page_title="VAE Latent Space Explorer", layout="centered")
 
 st.title("🌌 VAE Latent Space Explorer")
-st.markdown(
-    """
-This app visualizes the continuous nature of a Variational Autoencoder's latent space. 
-Adjust the $z_1$ and $z_2$ sliders below to navigate the 2D plane and watch how the decoder generates a new image based on your coordinates.
 
-*Note: This decoder uses random initialization to demonstrate the concept. You will see smooth, continuous noise patterns morphing into each other.*
+# Model Selection
+model_type = st.sidebar.selectbox(
+    "Choose Model",
+    ["MNIST (28x28 Grayscale)", "Dogs (256x256 RGB)"]
+)
+
+@st.cache_resource
+def load_vae_model(m_type):
+    if m_type == "MNIST (28x28 Grayscale)":
+        model = SimpleDecoder()
+        path = 'decoder_weights.pth'
+        is_rgb = False
+    else:
+        model = ConvolutionalDecoder()
+        path = 'dog_vae_256.pth'
+        is_rgb = True
+    
+    try:
+        state_dict = torch.load(path, map_location='cpu')
+        # Handle case where full VAE state dict is saved (like in dog.py)
+        # and we only want the decoder parts.
+        filtered_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith('decoder') or k.startswith('fc3') or k.startswith('fc2') or k.startswith('fc1'):
+                # For ConvolutionalDecoder, keys match 'decoder_input' and 'decoder'
+                # For SimpleDecoder, they match 'fc1', 'fc2', 'fc3'
+                filtered_dict[k] = v
+        
+        # If we didn't find specific prefixes, just try loading directly
+        if not filtered_dict:
+            model.load_state_dict(state_dict)
+        else:
+            # Check if we are loading into SimpleDecoder or ConvolutionalDecoder
+            # ConvolutionalDecoder expects 'decoder_input' and 'decoder'
+            # SimpleDecoder expects 'fc1', 'fc2', 'fc3'
+            model.load_state_dict(filtered_dict, strict=False)
+            
+        st.sidebar.success(f"✅ Loaded {path}")
+    except FileNotFoundError:
+        st.sidebar.warning(f"⚠️ '{path}' not found. Using random weights.")
+        
+    model.eval()
+    return model, is_rgb
+
+decoder, is_rgb = load_vae_model(model_type)
+
+st.markdown(
+    f"""
+This app visualizes the continuous nature of a Variational Autoencoder's latent space. 
+Currently exploring: **{model_type}**.
 """
 )
 
 st.divider()
 
-# Create two columns for the sliders
+# Sliders for latent space
 col1, col2 = st.columns(2)
-
 with col1:
-    z1 = st.slider(
-        "Latent Variable $z_1$ (X-axis)",
-        min_value=-3.0,
-        max_value=3.0,
-        value=0.0,
-        step=0.1,
-    )
-
+    z1 = st.slider("z1 (X-axis)", -3.0, 3.0, 0.0, 0.1)
 with col2:
-    z2 = st.slider(
-        "Latent Variable $z_2$ (Y-axis)",
-        min_value=-3.0,
-        max_value=3.0,
-        value=0.0,
-        step=0.1,
-    )
+    z2 = st.slider("z2 (Y-axis)", -3.0, 3.0, 0.0, 0.1)
 
-# ==========================================
-# 3. Generate and Display the Image
-# ==========================================
+# Generate and Display
 st.subheader("Generated Output")
-
-# Convert the slider values into a PyTorch tensor
 z_tensor = torch.tensor([[z1, z2]], dtype=torch.float32)
 
-# Pass the latent vector through the decoder
 with torch.no_grad():
     generated_image = decoder(z_tensor).numpy()
 
-# Display using Matplotlib
 fig, ax = plt.subplots(figsize=(4, 4))
-# Use a colormap to make the patterns easier to see
-cax = ax.imshow(generated_image, cmap="magma", interpolation="bilinear")
-ax.axis("off")  # Hide axes
-
-# Render the plot in Streamlit
+if is_rgb:
+    ax.imshow(generated_image)
+else:
+    ax.imshow(generated_image, cmap="magma", interpolation="bilinear")
+ax.axis("off")
 st.pyplot(fig)
-
-st.divider()
-st.caption(
-    "To use this with a real dataset (like MNIST or CelebA), replace `SimpleDecoder` with your trained PyTorch model and load your saved weights (`.pth` file)."
-)
