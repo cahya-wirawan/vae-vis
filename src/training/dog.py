@@ -118,10 +118,31 @@ class VAE(nn.Module):
             nn.Sigmoid(),
         )
 
+        # Initialize weights properly to prevent NaN
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.kaiming_normal_(m.weight, a=0.2, nonlinearity='leaky_relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
     def encode(self, x):
         h = self.encoder(x)
         h = self.fc_hidden(h)
-        return self.fc_mu(h), self.fc_logvar(h)
+        mu = self.fc_mu(h)
+        logvar = self.fc_logvar(h)
+        # Clamp logvar to prevent exp() overflow → NaN
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+        return mu, logvar
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -143,8 +164,11 @@ def vae_loss(reconstructed_x, x, mu, logvar, kl_weight=1.0):
     # Use 'mean' reduction for stable, interpretable loss values
     MSE = nn.functional.mse_loss(reconstructed_x, x, reduction="mean")
     # KL Divergence: mean over batch for consistency
-    KLD = -0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
-    return MSE + kl_weight * KLD, MSE.item(), KLD.item()
+    # logvar is already clamped in encode(), but clamp here too for safety
+    logvar_safe = torch.clamp(logvar, min=-10.0, max=10.0)
+    KLD = -0.5 * torch.mean(torch.sum(1 + logvar_safe - mu.pow(2) - logvar_safe.exp(), dim=1))
+    total = MSE + kl_weight * KLD
+    return total, MSE.item(), KLD.item()
 
 
 model = VAE(LATENT_DIM).to(DEVICE)
