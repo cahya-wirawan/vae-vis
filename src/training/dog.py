@@ -10,11 +10,11 @@ import os
 # 1. Hyperparameters & Setup
 # ==========================================
 BATCH_SIZE = 32  # Smaller batch for small dataset + larger model
-EPOCHS = 200  # More epochs since augmentation adds variety
-LEARNING_RATE = 3e-4
-LATENT_DIM = 128  # Keeping it 2D for visualization compatibility
-KL_WEIGHT_MAX = 0.005  # Beta for beta-VAE — must match MSE scale (~0.08) vs KLD scale (~12)
-KL_WARMUP_EPOCHS = 30  # Gradually increase KL weight over this many epochs
+EPOCHS = 250     # More epochs for the deeper model
+LEARNING_RATE = 2e-4 # Slightly lower LR for stability
+LATENT_DIM = 128
+KL_WEIGHT_MAX = 0.0005  # REDUCED: Avoids crushing features (Posterior Collapse)
+KL_WARMUP_EPOCHS = 50   # SLOWER WARMUP: Lets the model learn to reconstruct first
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 print(f"Training on: {DEVICE}")
@@ -104,17 +104,18 @@ def upsample_block(in_ch, out_ch, final=False):
     ]
     if not final:
         layers += [nn.BatchNorm2d(out_ch), nn.ReLU()]
+        # Add refinement conv for more capacity
+        layers += [nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1), nn.BatchNorm2d(out_ch), nn.ReLU()]
     else:
         layers += [nn.Sigmoid()]
     return nn.Sequential(*layers)
 
 
 class VAE(nn.Module):
-    def __init__(self, latent_dim=2):
+    def __init__(self, latent_dim=128):
         super().__init__()
 
         # ENCODER: Compresses 3x256x256 input
-        # Uses BatchNorm + LeakyReLU for stable gradients
         self.encoder = nn.Sequential(
             nn.Conv2d(3, 32, 4, stride=2, padding=1),  # -> 32x128x128
             nn.BatchNorm2d(32),
@@ -134,7 +135,6 @@ class VAE(nn.Module):
             nn.Flatten(),  # -> 32768
         )
 
-        # Intermediate FC layers to ease the bottleneck (32768 -> 512 -> latent)
         flat_size = 512 * 8 * 8  # 32768
         self.fc_hidden = nn.Sequential(
             nn.Linear(flat_size, 512),
@@ -144,7 +144,6 @@ class VAE(nn.Module):
         self.fc_logvar = nn.Linear(512, latent_dim)
 
         # DECODER: Reconstructs 3x256x256 output
-        # Mirror the encoder with intermediate FC layers
         self.decoder_fc = nn.Sequential(
             nn.Linear(latent_dim, 512),
             nn.ReLU(),
@@ -152,7 +151,6 @@ class VAE(nn.Module):
             nn.ReLU(),
         )
 
-        # Upsample + Conv2d instead of ConvTranspose2d (avoids checkerboard artifacts)
         self.decoder = nn.Sequential(
             upsample_block(512, 256),   # -> 256x16x16
             upsample_block(256, 128),   # -> 128x32x32
@@ -161,7 +159,6 @@ class VAE(nn.Module):
             upsample_block(32, 3, final=True),  # -> 3x256x256
         )
 
-        # Initialize weights properly to prevent NaN
         self._init_weights()
 
     def _init_weights(self):
@@ -183,7 +180,6 @@ class VAE(nn.Module):
         h = self.fc_hidden(h)
         mu = self.fc_mu(h)
         logvar = self.fc_logvar(h)
-        # Clamp logvar to prevent exp() overflow → NaN
         logvar = torch.clamp(logvar, min=-10.0, max=10.0)
         return mu, logvar
 
@@ -204,15 +200,15 @@ class VAE(nn.Module):
 
 
 def vae_loss(reconstructed_x, x, mu, logvar, perceptual_fn, kl_weight=1.0):
-    # L1 loss: sharper than MSE (doesn't over-penalize outlier pixels)
+    # L1 loss: sharper than MSE
     L1 = nn.functional.l1_loss(reconstructed_x, x, reduction="mean")
-    # Perceptual loss: penalizes blurriness by comparing VGG features
+    # Perceptual loss: matches high-level features
     P_LOSS = perceptual_fn(reconstructed_x, x)
     # KL Divergence
     logvar_safe = torch.clamp(logvar, min=-10.0, max=10.0)
     KLD = -0.5 * torch.mean(torch.sum(1 + logvar_safe - mu.pow(2) - logvar_safe.exp(), dim=1))
-    # Weighted combination: reconstruction (L1 + perceptual) + KL
-    recon_loss = L1 + 0.1 * P_LOSS
+    # Combine: L1 + Strong Perceptual + KL
+    recon_loss = L1 + 1.0 * P_LOSS  # INCREASED: Stronger focus on features/sharpness
     total = recon_loss + kl_weight * KLD
     return total, recon_loss.item(), KLD.item()
 
@@ -222,7 +218,6 @@ perceptual_loss = VGGPerceptualLoss().to(DEVICE)
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
 
-# Print model parameter count
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Model parameters: {total_params:,}")
 
@@ -239,7 +234,6 @@ for epoch in range(EPOCHS):
     train_kld = 0
     num_batches = 0
 
-    # KL warm-up: linearly increase kl_weight from 0 to KL_WEIGHT_MAX
     kl_weight = min(1.0, epoch / KL_WARMUP_EPOCHS) * KL_WEIGHT_MAX
 
     for batch in train_loader:
@@ -253,7 +247,6 @@ for epoch in range(EPOCHS):
         )
         loss.backward()
 
-        # Gradient clipping to prevent exploding gradients
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         train_loss += loss.item()
@@ -272,19 +265,12 @@ for epoch in range(EPOCHS):
         print(
             f"Epoch [{epoch+1}/{EPOCHS}] - Loss: {avg_loss:.6f} | "
             f"Recon(L1+Perc): {avg_recon:.6f} | KLD: {avg_kld:.6f} | "
-            f"KL_w: {kl_weight:.3f} | LR: {scheduler.get_last_lr()[0]:.2e}"
+            f"KL_w: {kl_weight:.5f} | LR: {scheduler.get_last_lr()[0]:.2e}"
         )
 
-    # Save best model
     if avg_loss < best_loss:
         best_loss = avg_loss
         torch.save(model.state_dict(), "dog_vae_256_best.pth")
 
-# ==========================================
-# 5. Save Weights
-# ==========================================
-# Save the final model and report best result
 torch.save(model.state_dict(), "dog_vae_256.pth")
 print(f"\n✅ Training complete! Best loss: {best_loss:.6f}")
-print("Saved 'dog_vae_256.pth' (final) and 'dog_vae_256_best.pth' (best).")
-print("Note: This architecture is Convolutional and output is 256x256 RGB.")
