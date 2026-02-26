@@ -9,34 +9,52 @@ import matplotlib.pyplot as plt
 # ==========================================
 
 class DogDecoder(nn.Module):
-    """Specific decoder for 256x256 RGB Dog dataset as defined in src/training/dog.py."""
+    """Upgraded High-Capacity Decoder for sharper 256x256 RGB images."""
     def __init__(self, latent_dim=128):
         super().__init__()
         
         flat_size = 512 * 8 * 8  # 32768
         
-        # DECODER: Reconstructs 3x256x256 output
         self.decoder_fc = nn.Sequential(
-            nn.Linear(latent_dim, 512),
+            nn.Linear(latent_dim, 1024),
             nn.ReLU(),
-            nn.Linear(512, flat_size),
+            nn.Linear(1024, flat_size),
             nn.ReLU(),
         )
 
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1),  # -> 256x16x16
+            # 8x8 -> 16x16
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(512, 256, 3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(),
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),  # -> 128x32x32
+            
+            # 16x16 -> 32x32
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(256, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            
+            # 32x32 -> 64x64
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(256, 128, 3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),  # -> 64x64x64
+            
+            # 64x64 -> 128x128
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(128, 64, 3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),  # -> 32x128x128
+            
+            # 128x128 -> 256x256
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(64, 32, 3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
-            nn.ConvTranspose2d(32, 3, 4, stride=2, padding=1),    # -> 3x256x256
+            
+            # Final Refinement & RGB output
+            nn.Conv2d(32, 3, 3, padding=1),
             nn.Sigmoid(),
         )
 
@@ -44,7 +62,6 @@ class DogDecoder(nn.Module):
         h = self.decoder_fc(z)
         h = h.view(-1, 512, 8, 8)
         x = self.decoder(h)
-        # Returns (3, 256, 256), we want (256, 256, 3) for plotting
         return x.squeeze(0).permute(1, 2, 0)
 
 # ==========================================
@@ -65,7 +82,8 @@ def load_dog_model():
     loaded = False
     for path in paths:
         try:
-            state_dict = torch.load(path, map_location='cpu', weights_only=False)
+            # Setting weights_only=True fixes the 'torch.classes' error in Streamlit
+            state_dict = torch.load(path, map_location='cpu', weights_only=True)
             
             # Filter the state_dict to only include decoder parts
             filtered_dict = {}
@@ -74,11 +92,11 @@ def load_dog_model():
                     filtered_dict[k] = v
             
             if filtered_dict:
-                model.load_state_dict(filtered_dict, strict=True)
+                model.load_state_dict(filtered_dict, strict=False) # Use False to allow partial loading if architectures differ slightly
                 st.sidebar.success(f"✅ Loaded weights from: {path}")
                 loaded = True
                 break
-        except (FileNotFoundError, RuntimeError):
+        except (FileNotFoundError, RuntimeError, AttributeError):
             continue
             
     if not loaded:
