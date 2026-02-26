@@ -25,6 +25,28 @@ impl VaeDecoder {
     
     // Takes the latent coordinates and returns 784 grayscale pixels (0-255)
     pub fn generate(&self, z1: f32, z2: f32) -> Vec<u8> {
+        self.decode_latent(z1, z2)
+    }
+
+    // Generates a grid of images (e.g., 4x4) covering a range of latent values
+    pub fn generate_grid(&self, steps: usize, min_z: f32, max_z: f32) -> Vec<u8> {
+        let mut all_pixels = Vec::with_capacity(steps * steps * 784);
+        
+        for i in 0..steps {
+            // y-axis (z2)
+            let z2 = max_z - (i as f32 / (steps - 1) as f32) * (max_z - min_z);
+            for j in 0..steps {
+                // x-axis (z1)
+                let z1 = min_z + (j as f32 / (steps - 1) as f32) * (max_z - min_z);
+                let pixels = self.decode_latent(z1, z2);
+                all_pixels.extend(pixels);
+            }
+        }
+        all_pixels
+    }
+
+    // Internal helper for the forward pass
+    fn decode_latent(&self, z1: f32, z2: f32) -> Vec<u8> {
         let mut h1 = vec![0.0; 128];
         let mut h2 = vec![0.0; 256];
         let mut out = vec![0.0; 784];
@@ -54,7 +76,7 @@ impl VaeDecoder {
             out[i] = 1.0 / (1.0 + (-val).exp()); 
         }
 
-        // Convert 0.0-1.0 float values to 0-255 byte values for the canvas
+        // Convert 0.0-1.0 float values to 0-255 byte values
         out.into_iter().map(|p| (p * 255.0) as u8).collect()
     }
 }

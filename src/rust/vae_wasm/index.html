@@ -14,16 +14,26 @@
 <body>
 
     <h2>Rust + Wasm VAE Latent Space</h2>
-    <canvas id="vae-canvas" width="28" height="28"></canvas>
-
-    <div class="sliders">
-        <div class="slider-group">
-            <label>z1 (X-axis)</label>
-            <input type="range" id="z1" min="-3" max="3" step="0.1" value="0">
+    
+    <div style="display: flex; gap: 40px; align-items: flex-start;">
+        <div class="explorer">
+            <h3>Interactive Explorer</h3>
+            <canvas id="vae-canvas" width="28" height="28"></canvas>
+            <div class="sliders">
+                <div class="slider-group">
+                    <label>z1 (X-axis)</label>
+                    <input type="range" id="z1" min="-3" max="3" step="0.1" value="0">
+                </div>
+                <div class="slider-group">
+                    <label>z2 (Y-axis)</label>
+                    <input type="range" id="z2" min="-3" max="3" step="0.1" value="0">
+                </div>
+            </div>
         </div>
-        <div class="slider-group">
-            <label>z2 (Y-axis)</label>
-            <input type="range" id="z2" min="-3" max="3" step="0.1" value="0">
+
+        <div class="grid-container">
+            <h3>4x4 Latent Grid (-2.0 to 2.0)</h3>
+            <canvas id="grid-canvas" width="112" height="112" style="width: 280px; height: 280px;"></canvas>
         </div>
     </div>
 
@@ -35,38 +45,66 @@
             await init(); // Initialize WebAssembly
             
             const decoder = new VaeDecoder();
+            
+            // --- Explorer Setup ---
             const canvas = document.getElementById('vae-canvas');
             const ctx = canvas.getContext('2d');
-            
             const z1Input = document.getElementById('z1');
             const z2Input = document.getElementById('z2');
 
             function updateImage() {
                 const z1 = parseFloat(z1Input.value);
                 const z2 = parseFloat(z2Input.value);
-
-                // 1. Call Rust to do the heavy math
                 const pixels = decoder.generate(z1, z2);
-
-                // 2. Draw the returned array to the HTML Canvas
                 const imageData = ctx.createImageData(28, 28);
                 for (let i = 0; i < 784; i++) {
                     const val = pixels[i];
                     const idx = i * 4;
-                    imageData.data[idx] = val;     // R
-                    imageData.data[idx+1] = val;   // G
-                    imageData.data[idx+2] = val;   // B
-                    imageData.data[idx+3] = 255;   // Alpha
+                    imageData.data[idx] = val; imageData.data[idx+1] = val; imageData.data[idx+2] = val; imageData.data[idx+3] = 255;
                 }
                 ctx.putImageData(imageData, 0, 0);
             }
 
-            // Listen for slider movements
+            // --- Grid Setup ---
+            const gridCanvas = document.getElementById('grid-canvas');
+            const gridCtx = gridCanvas.getContext('2d');
+
+            function renderGrid() {
+                const steps = 4;
+                const pixels = decoder.generate_grid(steps, -2.0, 2.0);
+                const fullImageData = gridCtx.createImageData(112, 112);
+                
+                // The pixels are returned as a flat array of 16 images (28x28 each)
+                // We need to map them to the 112x112 grid canvas
+                for (let row = 0; row < steps; row++) {
+                    for (let col = 0; col < steps; col++) {
+                        const imgIdx = row * steps + col;
+                        const imgStart = imgIdx * 784;
+                        
+                        for (let y = 0; y < 28; y++) {
+                            for (let x = 0; x < 28; x++) {
+                                const val = pixels[imgStart + y * 28 + x];
+                                // Calculate position in the 112x112 canvas
+                                const canvasX = col * 28 + x;
+                                const canvasY = row * 28 + y;
+                                const canvasIdx = (canvasY * 112 + canvasX) * 4;
+                                
+                                fullImageData.data[canvasIdx] = val;
+                                fullImageData.data[canvasIdx+1] = val;
+                                fullImageData.data[canvasIdx+2] = val;
+                                fullImageData.data[canvasIdx+3] = 255;
+                            }
+                        }
+                    }
+                }
+                gridCtx.putImageData(fullImageData, 0, 0);
+            }
+
             z1Input.addEventListener('input', updateImage);
             z2Input.addEventListener('input', updateImage);
 
-            // Initial draw
             updateImage();
+            renderGrid();
         }
 
         run();
