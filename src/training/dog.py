@@ -19,6 +19,7 @@ KL_WEIGHT_MAX = 0.0001  # Very low: prioritize reconstruction quality first
 KL_WARMUP_EPOCHS = 30
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SAMPLE_DIR = "samples"
+RESUME_FROM = None  # Set to checkpoint path to resume, e.g. "dog_vae_128_checkpoint.pth"
 
 os.makedirs(SAMPLE_DIR, exist_ok=True)
 print(f"Training on: {DEVICE}")
@@ -290,6 +291,22 @@ total_params = sum(p.numel() for p in model.parameters())
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"Model parameters: {total_params:,} (trainable: {trainable_params:,})")
 
+# Resume from checkpoint if specified
+start_epoch = 0
+best_loss = float("inf")
+if RESUME_FROM and os.path.isfile(RESUME_FROM):
+    print(f"Loading checkpoint: {RESUME_FROM}")
+    checkpoint = torch.load(RESUME_FROM, map_location=DEVICE, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    start_epoch = checkpoint["epoch"] + 1
+    best_loss = checkpoint.get("best_loss", float("inf"))
+    print(f"Resuming from epoch {start_epoch}, best_loss: {best_loss:.6f}")
+else:
+    if RESUME_FROM:
+        print(f"WARNING: Checkpoint '{RESUME_FROM}' not found, training from scratch.")
+
 
 # ==========================================
 # 5. Visualization Helper
@@ -314,11 +331,10 @@ def save_samples(model, epoch, data_batch):
 # 6. Training Loop
 # ==========================================
 model.train()
-print("Starting training...")
-best_loss = float("inf")
+print(f"Starting training from epoch {start_epoch}...")
 viz_batch = None  # Will store a fixed batch for consistent visualization
 
-for epoch in range(EPOCHS):
+for epoch in range(start_epoch, EPOCHS):
     train_loss = 0
     train_l1 = 0
     train_perc = 0
@@ -368,6 +384,16 @@ for epoch in range(EPOCHS):
     if (epoch + 1) % 25 == 0 and viz_batch is not None:
         save_samples(model, epoch, viz_batch)
         print(f"  → Saved samples to {SAMPLE_DIR}/")
+
+    # Save checkpoint (full state for resuming)
+    checkpoint_data = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "best_loss": best_loss,
+    }
+    torch.save(checkpoint_data, "dog_vae_128_checkpoint.pth")
 
     # Save best model
     if avg_loss < best_loss:
