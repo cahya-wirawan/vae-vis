@@ -8,49 +8,69 @@ import matplotlib.pyplot as plt
 # 1. Define VAE Decoder Architecture (Matches src/training/dog.py)
 # ==========================================
 
-def upsample_block(in_ch, out_ch, final=False):
-    """Upsample + Conv2d instead of ConvTranspose2d to avoid checkerboard artifacts."""
-    layers = [
-        nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-        nn.Conv2d(in_ch, out_ch, 3, stride=1, padding=1),
-    ]
-    if not final:
-        layers += [nn.BatchNorm2d(out_ch), nn.ReLU()]
-        # Add refinement conv for more capacity (Matches dog.py)
-        layers += [nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1), nn.BatchNorm2d(out_ch), nn.ReLU()]
-    else:
-        layers += [nn.Sigmoid()]
-    return nn.Sequential(*layers)
-
-class DogDecoder(nn.Module):
-    """Specific decoder for 256x256 RGB Dog dataset as defined in src/training/dog.py."""
-    def __init__(self, latent_dim=128):
+class DecoderBlock(nn.Module):
+    """Upsample + concat skip + Conv layers. Matches training architecture."""
+    def __init__(self, in_ch, skip_ch, out_ch):
         super().__init__()
-        
-        flat_size = 512 * 8 * 8  # 32768
-        
-        # DECODER FC: Mirror of dog.py
-        self.decoder_fc = nn.Sequential(
-            nn.Linear(latent_dim, 512),
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch + skip_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
             nn.ReLU(),
-            nn.Linear(512, flat_size),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
             nn.ReLU(),
         )
 
-        # DECODER CNN: Mirror of dog.py
-        self.decoder = nn.Sequential(
-            upsample_block(512, 256),   # -> 256x16x16
-            upsample_block(256, 128),   # -> 128x32x32
-            upsample_block(128, 64),    # -> 64x64x64
-            upsample_block(64, 32),     # -> 32x128x128
-            upsample_block(32, 3, final=True),  # -> 3x256x256
+    def forward(self, x, skip):
+        x = self.up(x)
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
+
+
+class DogDecoder(nn.Module):
+    """Decoder for 128x128 RGB Dog VAE with U-Net skip connections.
+    At inference (no encoder), uses zero tensors for skip connections."""
+    def __init__(self, latent_dim=128):
+        super().__init__()
+
+        flat_size = 512 * 4 * 4  # 8192
+
+        # DECODER FC: Matches dog.py
+        self.decoder_fc = nn.Sequential(
+            nn.Linear(latent_dim, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, flat_size),
+            nn.ReLU(),
+        )
+
+        # DECODER with skip connections (fed zeros at inference)
+        self.dec5 = DecoderBlock(512, 512, 512)   # 4->8
+        self.dec4 = DecoderBlock(512, 256, 256)   # 8->16
+        self.dec3 = DecoderBlock(256, 128, 128)   # 16->32
+        self.dec2 = DecoderBlock(128, 64, 64)     # 32->64
+
+        # Final upsample: 64->128
+        self.dec1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Conv2d(32, 3, 3, padding=1),
+            nn.Sigmoid(),
         )
 
     def forward(self, z):
         h = self.decoder_fc(z)
-        h = h.view(-1, 512, 8, 8)
-        x = self.decoder(h)
-        # Returns (3, 256, 256), we want (256, 256, 3) for plotting
+        h = h.view(-1, 512, 4, 4)
+        b = z.shape[0]
+        # Zero skip connections (no encoder at inference)
+        h = self.dec5(h, torch.zeros(b, 512, 8, 8))
+        h = self.dec4(h, torch.zeros(b, 256, 16, 16))
+        h = self.dec3(h, torch.zeros(b, 128, 32, 32))
+        h = self.dec2(h, torch.zeros(b, 64, 64, 64))
+        x = self.dec1(h)
+        # Returns (128, 128, 3) for plotting
         return x.squeeze(0).permute(1, 2, 0)
 
 # ==========================================
@@ -65,39 +85,38 @@ LATENT_DIM = 128
 @st.cache_resource
 def load_dog_model():
     model = DogDecoder(latent_dim=LATENT_DIM)
-    # Paths to look for weights
     paths = [
-        'dog_vae_256.pth', 
-        'dog_vae_256_best.pth', 
-        'src/training/dog_vae_256.pth', 
-        'src/python/dog_vae_256.pth',
-        '../training/dog_vae_256.pth'
+        'dog_vae_128.pth',
+        'dog_vae_128_best.pth',
+        'src/training/dog_vae_128.pth',
+        'src/training/dog_vae_128_best.pth',
+        'src/python/dog_vae_128.pth',
+        '../training/dog_vae_128.pth',
+        '../training/dog_vae_128_best.pth',
     ]
-    
+
     loaded = False
     for path in paths:
         try:
-            # Using weights_only=True for security and to avoid Streamlit/Torch proxy errors
             state_dict = torch.load(path, map_location='cpu', weights_only=True)
-            
-            # Filter the state_dict to only include decoder parts
+
+            # Filter to only decoder keys and remap them
             filtered_dict = {}
             for k, v in state_dict.items():
-                if k.startswith('decoder'):
+                if k.startswith('decoder_fc.') or k.startswith('dec'):
                     filtered_dict[k] = v
-            
+
             if filtered_dict:
-                # Load with strict=True now that architectures are aligned
                 model.load_state_dict(filtered_dict, strict=True)
                 st.sidebar.success(f"✅ Loaded weights from: {path}")
                 loaded = True
                 break
         except Exception:
             continue
-            
+
     if not loaded:
         st.sidebar.warning(f"⚠️ No weights found for {LATENT_DIM}D model. Using random initialization.")
-        
+
     model.eval()
     return model
 
@@ -119,8 +138,8 @@ pc1, pc2 = get_pca_projection(LATENT_DIM)
 
 st.markdown(
     f"""
-This app visualizes a **{LATENT_DIM}D** Variational Autoencoder's latent space. 
-We use **PCA Projection** to map your 2D input to the high-dimensional space.
+This app visualizes a **{LATENT_DIM}D** Variational Autoencoder trained on dog images (128×128 RGB).
+We use **PCA Projection** to map your 2D input to the high-dimensional latent space.
 """
 )
 
