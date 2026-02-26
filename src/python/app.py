@@ -82,6 +82,9 @@ def load_vae_model(m_type):
 
 decoder, is_rgb = load_vae_model(model_type)
 
+# ==========================================
+# 2. Latent Space Exploration
+# ==========================================
 st.markdown(
     f"""
 This app visualizes the continuous nature of a Variational Autoencoder's latent space. 
@@ -89,18 +92,41 @@ Currently exploring: **{model_type}**.
 """
 )
 
+# 1. Detect Latent Dimension from the model
+if model_type == "MNIST (28x28 Grayscale)":
+    latent_dim = decoder.fc1.in_features
+else:
+    latent_dim = decoder.decoder_input.in_features
+
+st.sidebar.divider()
+st.sidebar.write(f"🔢 **Model Latent Dim:** {latent_dim}")
+
 st.divider()
 
-# Sliders for latent space
-col1, col2 = st.columns(2)
-with col1:
-    z1 = st.slider("z1 (X-axis)", -3.0, 3.0, 0.0, 0.1)
-with col2:
-    z2 = st.slider("z2 (Y-axis)", -3.0, 3.0, 0.0, 0.1)
+# 2. Generate Dynamic Sliders
+z_values = []
+if latent_dim <= 10:
+    # For small latent spaces, show all dimensions
+    st.write(f"Adjusting all {latent_dim} latent variables:")
+    cols = st.columns(min(latent_dim, 4))
+    for i in range(latent_dim):
+        with cols[i % 4]:
+            val = st.slider(f"z{i+1}", -4.0, 4.0, 0.0, 0.1, key=f"z{i}")
+            z_values.append(val)
+else:
+    # For high latent spaces (like 128D), control the first 2 and zero the rest
+    # (Or you could implement PCA axis selection here)
+    st.info(f"💡 High-dimensional latent space ({latent_dim}D). Controlling first 2 dimensions, others set to 0.0.")
+    col1, col2 = st.columns(2)
+    with col1:
+        z1 = st.slider("z1", -5.0, 5.0, 0.0, 0.1)
+    with col2:
+        z2 = st.slider("z2", -5.0, 5.0, 0.0, 0.1)
+    z_values = [z1, z2] + [0.0] * (latent_dim - 2)
 
-# Generate and Display
+# 3. Generate and Display
 st.subheader("Generated Output")
-z_tensor = torch.tensor([[z1, z2]], dtype=torch.float32)
+z_tensor = torch.tensor([z_values], dtype=torch.float32)
 
 with torch.no_grad():
     # Model forward pass
