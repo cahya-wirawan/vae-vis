@@ -10,30 +10,29 @@ import os
 # ==========================================
 # 1. Hyperparameters & Setup
 # ==========================================
-BATCH_SIZE = 32
-EPOCHS = 300
+BATCH_SIZE = 64          # Larger batch — AFHQ has ~15K images
+EPOCHS = 100             # Fewer epochs needed with more data
 LEARNING_RATE = 2e-4
 LATENT_DIM = 128
-IMG_SIZE = 128           # Reduced from 256: much more tractable for ~200 images
-KL_WEIGHT_MAX = 0.005    # Raised from 0.0005: keeps latent space usable for generation
-KL_WARMUP_EPOCHS = 80    # Slow warmup to let reconstruction stabilize first
+IMG_SIZE = 128
+KL_WEIGHT_MAX = 0.005
+KL_WARMUP_EPOCHS = 20    # Faster warmup — more data stabilizes training quicker
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SAMPLE_DIR = "samples"   # Directory for periodic visualization
+SAMPLE_DIR = "samples"
 
 os.makedirs(SAMPLE_DIR, exist_ok=True)
 print(f"Training on: {DEVICE}")
 
-# Load the dataset from Hugging Face
-print("Loading huggan/few-shot-dog dataset...")
-dataset = load_dataset("huggan/few-shot-dog", split="train")
+# Load the AFHQ dataset from Hugging Face
+print("Loading huggan/AFHQ dataset...")
+dataset = load_dataset("huggan/AFHQ", split="train")
 print(f"Dataset size: {len(dataset)} images")
 
-# Data augmentation
+# Data augmentation (lighter — dataset is much larger now)
 transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.RandomHorizontalFlip(),
-    transforms.RandomAffine(degrees=10, translate=(0.05, 0.05), scale=(0.9, 1.1)),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+    transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
     transforms.ToTensor(),
 ])
 
