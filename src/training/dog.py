@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from datasets import load_dataset
-from torchvision import transforms
+from torchvision import transforms, models
 from torch.utils.data import DataLoader
 import os
 
@@ -56,8 +56,59 @@ train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_las
 
 
 # ==========================================
-# 2. Define the VAE Architecture (Convolutional)
+# 2. Perceptual Loss (VGG Feature Matching)
 # ==========================================
+class VGGPerceptualLoss(nn.Module):
+    """Extracts features from pretrained VGG19 to compute perceptual loss.
+    Penalizes differences in high-level features, not just pixels — this
+    is what prevents blurriness."""
+    def __init__(self):
+        super().__init__()
+        vgg = models.vgg19(weights=models.VGG19_Weights.DEFAULT).features
+        # Extract features at layers: relu1_2, relu2_2, relu3_4, relu4_4
+        self.slice1 = nn.Sequential(*list(vgg[:4]))    # relu1_2
+        self.slice2 = nn.Sequential(*list(vgg[4:9]))   # relu2_2
+        self.slice3 = nn.Sequential(*list(vgg[9:18]))  # relu3_4
+        self.slice4 = nn.Sequential(*list(vgg[18:27])) # relu4_4
+        # Freeze all VGG parameters
+        for param in self.parameters():
+            param.requires_grad = False
+        # ImageNet normalization
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def normalize(self, x):
+        return (x - self.mean) / self.std
+
+    def forward(self, pred, target):
+        pred = self.normalize(pred)
+        target = self.normalize(target)
+        loss = 0.0
+        x, y = pred, target
+        for slicer in [self.slice1, self.slice2, self.slice3, self.slice4]:
+            x = slicer(x)
+            with torch.no_grad():
+                y = slicer(y)
+            loss += nn.functional.l1_loss(x, y)
+        return loss
+
+
+# ==========================================
+# 3. Define the VAE Architecture (Convolutional)
+# ==========================================
+def upsample_block(in_ch, out_ch, final=False):
+    """Upsample + Conv2d instead of ConvTranspose2d to avoid checkerboard artifacts."""
+    layers = [
+        nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+        nn.Conv2d(in_ch, out_ch, 3, stride=1, padding=1),
+    ]
+    if not final:
+        layers += [nn.BatchNorm2d(out_ch), nn.ReLU()]
+    else:
+        layers += [nn.Sigmoid()]
+    return nn.Sequential(*layers)
+
+
 class VAE(nn.Module):
     def __init__(self, latent_dim=2):
         super().__init__()
@@ -101,21 +152,13 @@ class VAE(nn.Module):
             nn.ReLU(),
         )
 
+        # Upsample + Conv2d instead of ConvTranspose2d (avoids checkerboard artifacts)
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1),  # -> 256x16x16
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),  # -> 128x32x32
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),  # -> 64x64x64
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),  # -> 32x128x128
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.ConvTranspose2d(32, 3, 4, stride=2, padding=1),  # -> 3x256x256
-            nn.Sigmoid(),
+            upsample_block(512, 256),   # -> 256x16x16
+            upsample_block(256, 128),   # -> 128x32x32
+            upsample_block(128, 64),    # -> 64x64x64
+            upsample_block(64, 32),     # -> 32x128x128
+            upsample_block(32, 3, final=True),  # -> 3x256x256
         )
 
         # Initialize weights properly to prevent NaN
@@ -160,18 +203,22 @@ class VAE(nn.Module):
         return self.decode(z), mu, logvar
 
 
-def vae_loss(reconstructed_x, x, mu, logvar, kl_weight=1.0):
-    # Use 'mean' reduction for stable, interpretable loss values
-    MSE = nn.functional.mse_loss(reconstructed_x, x, reduction="mean")
-    # KL Divergence: mean over batch for consistency
-    # logvar is already clamped in encode(), but clamp here too for safety
+def vae_loss(reconstructed_x, x, mu, logvar, perceptual_fn, kl_weight=1.0):
+    # L1 loss: sharper than MSE (doesn't over-penalize outlier pixels)
+    L1 = nn.functional.l1_loss(reconstructed_x, x, reduction="mean")
+    # Perceptual loss: penalizes blurriness by comparing VGG features
+    P_LOSS = perceptual_fn(reconstructed_x, x)
+    # KL Divergence
     logvar_safe = torch.clamp(logvar, min=-10.0, max=10.0)
     KLD = -0.5 * torch.mean(torch.sum(1 + logvar_safe - mu.pow(2) - logvar_safe.exp(), dim=1))
-    total = MSE + kl_weight * KLD
-    return total, MSE.item(), KLD.item()
+    # Weighted combination: reconstruction (L1 + perceptual) + KL
+    recon_loss = L1 + 0.1 * P_LOSS
+    total = recon_loss + kl_weight * KLD
+    return total, recon_loss.item(), KLD.item()
 
 
 model = VAE(LATENT_DIM).to(DEVICE)
+perceptual_loss = VGGPerceptualLoss().to(DEVICE)
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
 
@@ -188,7 +235,7 @@ best_loss = float("inf")
 
 for epoch in range(EPOCHS):
     train_loss = 0
-    train_mse = 0
+    train_recon = 0
     train_kld = 0
     num_batches = 0
 
@@ -201,8 +248,8 @@ for epoch in range(EPOCHS):
         optimizer.zero_grad()
         reconstructed_batch, mu, logvar = model(data)
 
-        loss, mse_val, kld_val = vae_loss(
-            reconstructed_batch, data, mu, logvar, kl_weight
+        loss, recon_val, kld_val = vae_loss(
+            reconstructed_batch, data, mu, logvar, perceptual_loss, kl_weight
         )
         loss.backward()
 
@@ -210,7 +257,7 @@ for epoch in range(EPOCHS):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         train_loss += loss.item()
-        train_mse += mse_val
+        train_recon += recon_val
         train_kld += kld_val
         num_batches += 1
         optimizer.step()
@@ -218,13 +265,13 @@ for epoch in range(EPOCHS):
     scheduler.step()
 
     avg_loss = train_loss / num_batches
-    avg_mse = train_mse / num_batches
+    avg_recon = train_recon / num_batches
     avg_kld = train_kld / num_batches
 
     if (epoch + 1) % 5 == 0:
         print(
             f"Epoch [{epoch+1}/{EPOCHS}] - Loss: {avg_loss:.6f} | "
-            f"MSE: {avg_mse:.6f} | KLD: {avg_kld:.6f} | "
+            f"Recon(L1+Perc): {avg_recon:.6f} | KLD: {avg_kld:.6f} | "
             f"KL_w: {kl_weight:.3f} | LR: {scheduler.get_last_lr()[0]:.2e}"
         )
 
