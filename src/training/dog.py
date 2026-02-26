@@ -13,7 +13,7 @@ BATCH_SIZE = 32  # Smaller batch for small dataset + larger model
 EPOCHS = 200  # More epochs since augmentation adds variety
 LEARNING_RATE = 3e-4
 LATENT_DIM = 2  # Keeping it 2D for visualization compatibility
-KL_WEIGHT_MAX = 0.5  # Beta for beta-VAE (balances reconstruction vs KL)
+KL_WEIGHT_MAX = 0.005  # Beta for beta-VAE — must match MSE scale (~0.08) vs KLD scale (~12)
 KL_WARMUP_EPOCHS = 30  # Gradually increase KL weight over this many epochs
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
