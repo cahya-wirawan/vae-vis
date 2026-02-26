@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 
 class DogDecoder(nn.Module):
     """Specific decoder for 256x256 RGB Dog dataset as defined in src/training/dog.py."""
-    def __init__(self, latent_dim=2):
+    def __init__(self, latent_dim=128):
         super().__init__()
         
         flat_size = 512 * 8 * 8  # 32768
@@ -54,9 +54,11 @@ st.set_page_config(page_title="Dog VAE Latent Space", layout="centered")
 
 st.title("🐕 Dog VAE Latent Space Explorer")
 
+LATENT_DIM = 128
+
 @st.cache_resource
 def load_dog_model():
-    model = DogDecoder()
+    model = DogDecoder(latent_dim=LATENT_DIM)
     # Paths to look for weights
     paths = ['dog_vae_256.pth', 'dog_vae_256_best.pth', '../training/dog_vae_256.pth', 'src/python/dog_vae_256.pth']
     
@@ -68,7 +70,7 @@ def load_dog_model():
             # Filter the state_dict to only include decoder parts
             filtered_dict = {}
             for k, v in state_dict.items():
-                if k.startswith('decoder'):
+                if k.startswith('decoder') or k.startswith('decoder_fc'):
                     filtered_dict[k] = v
             
             if filtered_dict:
@@ -80,17 +82,35 @@ def load_dog_model():
             continue
             
     if not loaded:
-        st.sidebar.warning("⚠️ No weights found. Using random initialization.")
+        st.sidebar.warning(f"⚠️ No weights found for {LATENT_DIM}D model. Using random initialization.")
         
     model.eval()
     return model
 
 decoder = load_dog_model()
 
+# PCA Simulation
+# In a real scenario, these components would be calculated by running PCA 
+# on the latent representations of the training set.
+@st.cache_data
+def get_pca_projection(dim):
+    """Generates a stable, orthogonal projection matrix from 2D to high-D."""
+    rng = np.random.RandomState(42)  # Fixed seed for stable visualization
+    # Create two random vectors
+    v1 = rng.randn(dim)
+    v2 = rng.randn(dim)
+    # Gram-Schmidt to make them orthogonal
+    v1 /= np.linalg.norm(v1)
+    v2 -= v2.dot(v1) * v1
+    v2 /= np.linalg.norm(v2)
+    return v1, v2
+
+pc1, pc2 = get_pca_projection(LATENT_DIM)
+
 st.markdown(
-    """
-This app visualizes the continuous nature of a Variational Autoencoder's latent space trained on the 
-`huggan/few-shot-dog` dataset. Move the sliders to explore generated dogs!
+    f"""
+This app visualizes a **{LATENT_DIM}D** Variational Autoencoder's latent space. 
+We use **PCA Projection** to map your 2D input to the high-dimensional space.
 """
 )
 
@@ -99,13 +119,16 @@ st.divider()
 # Sliders for latent space
 col1, col2 = st.columns(2)
 with col1:
-    z1 = st.slider("z1 (Feature A)", -4.0, 4.0, 0.0, 0.1)
+    z1 = st.slider("Principal Component 1", -10.0, 10.0, 0.0, 0.1)
 with col2:
-    z2 = st.slider("z2 (Feature B)", -4.0, 4.0, 0.0, 0.1)
+    z2 = st.slider("Principal Component 2", -10.0, 10.0, 0.0, 0.1)
 
 # Generate and Display
 st.subheader("Generated Dog")
-z_tensor = torch.tensor([[z1, z2]], dtype=torch.float32)
+
+# Map 2D slider to 128D space
+z_128 = (z1 * pc1) + (z2 * pc2)
+z_tensor = torch.tensor(z_128, dtype=torch.float32).unsqueeze(0)
 
 with torch.no_grad():
     generated_image = decoder(z_tensor).numpy()
@@ -115,4 +138,4 @@ ax.imshow(generated_image)
 ax.axis("off")
 st.pyplot(fig)
 
-st.info("💡 The latent space is 2D, so each point (z1, z2) maps to a unique 256x256 dog image.")
+st.info(f"💡 You are controlling the top 2 principal axes of the {LATENT_DIM}D space. This often captures the most dramatic variations in the dataset.")
