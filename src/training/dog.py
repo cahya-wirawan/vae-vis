@@ -10,15 +10,13 @@ import os
 # ==========================================
 # 1. Hyperparameters & Setup
 # ==========================================
-BATCH_SIZE = 64          # Larger batch — AFHQ has ~15K images
-EPOCHS = 100             # Fewer epochs needed with more data
+BATCH_SIZE = 64
+EPOCHS = 100
 LEARNING_RATE = 2e-4
 LATENT_DIM = 128
 IMG_SIZE = 128
-KL_WEIGHT_MAX = 0.005
-KL_WARMUP_EPOCHS = 20    # Faster warmup — more data stabilizes training quicker
-SKIP_DROP_PROB = 0.3     # Probability of zeroing skip connections during training
-                         # Forces decoder to learn generation without encoder features
+KL_WEIGHT_MAX = 0.0001   # Very low: prioritize reconstruction quality first
+KL_WARMUP_EPOCHS = 30
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SAMPLE_DIR = "samples"
 
@@ -92,88 +90,118 @@ class VGGPerceptualLoss(nn.Module):
 
 
 # ==========================================
-# 3. VAE with U-Net Skip Connections
+# 3. VAE Architecture (ResNet-style, no skip connections)
 # ==========================================
-class EncoderBlock(nn.Module):
-    """Conv -> BN -> LeakyReLU, halves spatial dims."""
-    def __init__(self, in_ch, out_ch):
+class ResBlock(nn.Module):
+    """Residual block: adds input back to output for better gradient flow."""
+    def __init__(self, channels):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 4, stride=2, padding=1),
-            nn.BatchNorm2d(out_ch),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.BatchNorm2d(channels),
+        )
+        self.act = nn.LeakyReLU(0.2)
+
+    def forward(self, x):
+        return self.act(x + self.block(x))
+
+
+class Encoder(nn.Module):
+    """Downsamples 3x128x128 → flat vector. No skip connections stored."""
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            # 3x128x128 -> 64x64x64
+            nn.Conv2d(3, 64, 4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2),
+            ResBlock(64),
+            # 64x64x64 -> 128x32x32
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2),
+            ResBlock(128),
+            # 128x32x32 -> 256x16x16
+            nn.Conv2d(128, 256, 4, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2),
+            ResBlock(256),
+            # 256x16x16 -> 512x8x8
+            nn.Conv2d(256, 512, 4, stride=2, padding=1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2),
+            ResBlock(512),
+            # 512x8x8 -> 512x4x4
+            nn.Conv2d(512, 512, 4, stride=2, padding=1),
+            nn.BatchNorm2d(512),
             nn.LeakyReLU(0.2),
         )
 
     def forward(self, x):
-        return self.block(x)
+        return self.net(x)
 
 
-class DecoderBlock(nn.Module):
-    """Upsample + Conv + BN + ReLU + Refine conv.
-    Accepts skip connection (concatenated on channel dim)."""
-    def __init__(self, in_ch, skip_ch, out_ch):
+class Decoder(nn.Module):
+    """Upsamples 512x4x4 → 3x128x128. All information comes from latent z only."""
+    def __init__(self):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        # in_ch + skip_ch because of the concatenated skip connection
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch + skip_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
+        self.net = nn.Sequential(
+            # 512x4x4 -> 512x8x8
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(512, 512, 3, padding=1),
+            nn.BatchNorm2d(512),
             nn.ReLU(),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
+            ResBlock(512),
+            # 512x8x8 -> 256x16x16
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(512, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
             nn.ReLU(),
-        )
-
-    def forward(self, x, skip):
-        x = self.up(x)
-        x = torch.cat([x, skip], dim=1)
-        return self.conv(x)
-
-
-class VAE(nn.Module):
-    def __init__(self, latent_dim=128):
-        super().__init__()
-
-        # ENCODER: 3x128x128 -> bottleneck
-        # Each block halves spatial dims and stores activations for skip connections
-        self.enc1 = EncoderBlock(3, 64)      # -> 64x64x64
-        self.enc2 = EncoderBlock(64, 128)    # -> 128x32x32
-        self.enc3 = EncoderBlock(128, 256)   # -> 256x16x16
-        self.enc4 = EncoderBlock(256, 512)   # -> 512x8x8
-        self.enc5 = EncoderBlock(512, 512)   # -> 512x4x4
-
-        # Bottleneck FC: 512*4*4 = 8192
-        flat_size = 512 * 4 * 4
-        self.fc_hidden = nn.Sequential(
-            nn.Linear(flat_size, 1024),
-            nn.LeakyReLU(0.2),
-        )
-        self.fc_mu = nn.Linear(1024, latent_dim)
-        self.fc_logvar = nn.Linear(1024, latent_dim)
-
-        # DECODER FC: latent -> spatial
-        self.decoder_fc = nn.Sequential(
-            nn.Linear(latent_dim, 1024),
+            ResBlock(256),
+            # 256x16x16 -> 128x32x32
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(256, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(),
-            nn.Linear(1024, flat_size),
+            ResBlock(128),
+            # 128x32x32 -> 64x64x64
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(128, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(),
-        )
-
-        # DECODER with skip connections from encoder
-        # Each block doubles spatial dims and concatenates encoder features
-        self.dec5 = DecoderBlock(512, 512, 512)   # 4->8,  concat enc4 (512)
-        self.dec4 = DecoderBlock(512, 256, 256)   # 8->16, concat enc3 (256)
-        self.dec3 = DecoderBlock(256, 128, 128)   # 16->32, concat enc2 (128)
-        self.dec2 = DecoderBlock(128, 64, 64)     # 32->64, concat enc1 (64)
-
-        # Final upsample: 64->128, no skip (input level)
-        self.dec1 = nn.Sequential(
+            ResBlock(64),
+            # 64x64x64 -> 3x128x128
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.Conv2d(64, 32, 3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.Conv2d(32, 3, 3, padding=1),
             nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class VAE(nn.Module):
+    def __init__(self, latent_dim=128):
+        super().__init__()
+
+        self.encoder = Encoder()
+        self.decoder = Decoder()
+
+        # Bottleneck FC: 512*4*4 = 8192
+        flat_size = 512 * 4 * 4
+        self.fc_mu = nn.Linear(flat_size, latent_dim)
+        self.fc_logvar = nn.Linear(flat_size, latent_dim)
+
+        # Decoder FC: latent -> spatial
+        self.decoder_fc = nn.Sequential(
+            nn.Linear(latent_dim, flat_size),
+            nn.ReLU(),
         )
 
         self._init_weights()
@@ -193,59 +221,26 @@ class VAE(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def encode(self, x):
-        # Run encoder, storing intermediate activations for skip connections
-        s1 = self.enc1(x)    # 64x64x64
-        s2 = self.enc2(s1)   # 128x32x32
-        s3 = self.enc3(s2)   # 256x16x16
-        s4 = self.enc4(s3)   # 512x8x8
-        h = self.enc5(s4)    # 512x4x4
-
+        h = self.encoder(x)
         h_flat = h.flatten(1)
-        h_fc = self.fc_hidden(h_flat)
-        mu = self.fc_mu(h_fc)
-        logvar = torch.clamp(self.fc_logvar(h_fc), min=-10.0, max=10.0)
-        return mu, logvar, [s1, s2, s3, s4]
+        mu = self.fc_mu(h_flat)
+        logvar = torch.clamp(self.fc_logvar(h_flat), min=-10.0, max=10.0)
+        return mu, logvar
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def _zero_skips(self, z):
-        """Create zero tensors matching skip connection shapes."""
-        b = z.shape[0]
-        return [
-            torch.zeros(b, 64, 64, 64, device=z.device),
-            torch.zeros(b, 128, 32, 32, device=z.device),
-            torch.zeros(b, 256, 16, 16, device=z.device),
-            torch.zeros(b, 512, 8, 8, device=z.device),
-        ]
-
-    def decode(self, z, skips=None):
+    def decode(self, z):
         h = self.decoder_fc(z)
         h = h.view(-1, 512, 4, 4)
+        return self.decoder(h)
 
-        if skips is None:
-            skips = self._zero_skips(z)
-
-        s1, s2, s3, s4 = skips
-        h = self.dec5(h, s4)   # 4->8
-        h = self.dec4(h, s3)   # 8->16
-        h = self.dec3(h, s2)   # 16->32
-        h = self.dec2(h, s1)   # 32->64
-        h = self.dec1(h)       # 64->128
-        return h
-
-    def forward(self, x, skip_drop_prob=0.0):
-        mu, logvar, skips = self.encode(x)
+    def forward(self, x):
+        mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
-
-        # Skip dropout: randomly zero all skips to train the decoder
-        # to produce good output without encoder features
-        if self.training and skip_drop_prob > 0 and torch.rand(1).item() < skip_drop_prob:
-            skips = self._zero_skips(z)
-
-        return self.decode(z, skips), mu, logvar
+        return self.decode(z), mu, logvar
 
 
 # ==========================================
@@ -285,13 +280,12 @@ def save_samples(model, epoch, data_batch):
     model.eval()
     # Reconstruct training images
     recon, _, _ = model(data_batch[:8])
-    # Show original vs reconstruction side by side
     comparison = torch.cat([data_batch[:8], recon], dim=0)
     save_image(comparison, f"{SAMPLE_DIR}/recon_epoch_{epoch+1:03d}.png", nrow=8)
 
     # Generate from random latent vectors
     z_random = torch.randn(8, LATENT_DIM, device=DEVICE)
-    generated = model.decode(z_random, skips=None)
+    generated = model.decode(z_random)
     save_image(generated, f"{SAMPLE_DIR}/gen_epoch_{epoch+1:03d}.png", nrow=8)
     model.train()
 
@@ -321,7 +315,7 @@ for epoch in range(EPOCHS):
             viz_batch = data.clone()
 
         optimizer.zero_grad()
-        reconstructed_batch, mu, logvar = model(data, skip_drop_prob=SKIP_DROP_PROB)
+        reconstructed_batch, mu, logvar = model(data)
 
         loss, l1_val, perc_val, kld_val = vae_loss(
             reconstructed_batch, data, mu, logvar, perceptual_loss_fn, kl_weight

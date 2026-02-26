@@ -8,50 +8,56 @@ import matplotlib.pyplot as plt
 # 1. Define VAE Decoder Architecture (Matches src/training/dog.py)
 # ==========================================
 
-class DecoderBlock(nn.Module):
-    """Upsample + concat skip + Conv layers. Matches training architecture."""
-    def __init__(self, in_ch, skip_ch, out_ch):
+class ResBlock(nn.Module):
+    """Residual block matching training architecture."""
+    def __init__(self, channels):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch + skip_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(),
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.BatchNorm2d(channels),
         )
+        self.act = nn.LeakyReLU(0.2)
 
-    def forward(self, x, skip):
-        x = self.up(x)
-        x = torch.cat([x, skip], dim=1)
-        return self.conv(x)
+    def forward(self, x):
+        return self.act(x + self.block(x))
 
 
 class DogDecoder(nn.Module):
-    """Decoder for 128x128 RGB Dog VAE with U-Net skip connections.
-    At inference (no encoder), uses zero tensors for skip connections."""
+    """Decoder for 128x128 RGB VAE. Matches training Decoder + decoder_fc."""
     def __init__(self, latent_dim=128):
         super().__init__()
 
         flat_size = 512 * 4 * 4  # 8192
 
-        # DECODER FC: Matches dog.py
         self.decoder_fc = nn.Sequential(
-            nn.Linear(latent_dim, 1024),
-            nn.ReLU(),
-            nn.Linear(1024, flat_size),
+            nn.Linear(latent_dim, flat_size),
             nn.ReLU(),
         )
 
-        # DECODER with skip connections (fed zeros at inference)
-        self.dec5 = DecoderBlock(512, 512, 512)   # 4->8
-        self.dec4 = DecoderBlock(512, 256, 256)   # 8->16
-        self.dec3 = DecoderBlock(256, 128, 128)   # 16->32
-        self.dec2 = DecoderBlock(128, 64, 64)     # 32->64
-
-        # Final upsample: 64->128
-        self.dec1 = nn.Sequential(
+        self.decoder = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(512, 512, 3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+            ResBlock(512),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(512, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            ResBlock(256),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(256, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            ResBlock(128),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(128, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            ResBlock(64),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.Conv2d(64, 32, 3, padding=1),
             nn.BatchNorm2d(32),
@@ -63,14 +69,7 @@ class DogDecoder(nn.Module):
     def forward(self, z):
         h = self.decoder_fc(z)
         h = h.view(-1, 512, 4, 4)
-        b = z.shape[0]
-        # Zero skip connections (no encoder at inference)
-        h = self.dec5(h, torch.zeros(b, 512, 8, 8))
-        h = self.dec4(h, torch.zeros(b, 256, 16, 16))
-        h = self.dec3(h, torch.zeros(b, 128, 32, 32))
-        h = self.dec2(h, torch.zeros(b, 64, 64, 64))
-        x = self.dec1(h)
-        # Returns (128, 128, 3) for plotting
+        x = self.decoder(h)
         return x.squeeze(0).permute(1, 2, 0)
 
 # ==========================================
