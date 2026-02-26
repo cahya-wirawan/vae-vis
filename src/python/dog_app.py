@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 
 # ==========================================
 # 1. Define VAE Decoder Architecture (Matches src/training/dog.py)
@@ -30,35 +31,42 @@ class DogDecoder(nn.Module):
     def __init__(self, latent_dim=128):
         super().__init__()
 
-        flat_size = 512 * 4 * 4  # 8192
+        # Bottleneck spatial size from training: 512*4*4 = 8192
+        flat_size = 512 * 4 * 4  
 
         self.decoder_fc = nn.Sequential(
             nn.Linear(latent_dim, flat_size),
             nn.ReLU(),
         )
 
-        self.decoder = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+        # This Sequential must match the structure of VAE.decoder.net in dog.py
+        self.decoder_net = nn.Sequential(
+            # 512x4x4 -> 512x8x8
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             nn.Conv2d(512, 512, 3, padding=1),
             nn.BatchNorm2d(512),
             nn.ReLU(),
             ResBlock(512),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            # 512x8x8 -> 256x16x16
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             nn.Conv2d(512, 256, 3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(),
             ResBlock(256),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            # 256x16x16 -> 128x32x32
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             nn.Conv2d(256, 128, 3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(),
             ResBlock(128),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            # 128x32x32 -> 64x64x64
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             nn.Conv2d(128, 64, 3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             ResBlock(64),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            # 64x64x64 -> 3x128x128
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             nn.Conv2d(64, 32, 3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
@@ -69,7 +77,7 @@ class DogDecoder(nn.Module):
     def forward(self, z):
         h = self.decoder_fc(z)
         h = h.view(-1, 512, 4, 4)
-        x = self.decoder(h)
+        x = self.decoder_net(h)
         return x.squeeze(0).permute(1, 2, 0)
 
 # ==========================================
@@ -91,26 +99,34 @@ def load_dog_model():
         'src/training/dog_vae_128_best.pth',
         'src/python/dog_vae_128.pth',
         '../training/dog_vae_128.pth',
-        '../training/dog_vae_128_best.pth',
     ]
 
     loaded = False
     for path in paths:
+        if not Path(path).exists():
+            continue
+            
         try:
+            # Setting weights_only=True fixes the 'torch.classes' error in Streamlit
             state_dict = torch.load(path, map_location='cpu', weights_only=True)
 
-            # Filter to only decoder keys and remap them
+            # Filter and remap keys to match DogDecoder structure
+            # trained: decoder.net.0... -> app: decoder_net.0...
             filtered_dict = {}
             for k, v in state_dict.items():
-                if k.startswith('decoder_fc.') or k.startswith('dec'):
+                if k.startswith('decoder_fc.'):
                     filtered_dict[k] = v
+                elif k.startswith('decoder.net.'):
+                    new_key = k.replace('decoder.net.', 'decoder_net.')
+                    filtered_dict[new_key] = v
 
             if filtered_dict:
                 model.load_state_dict(filtered_dict, strict=True)
                 st.sidebar.success(f"✅ Loaded weights from: {path}")
                 loaded = True
                 break
-        except Exception:
+        except Exception as e:
+            st.sidebar.error(f"Error loading {path}: {e}")
             continue
 
     if not loaded:
@@ -137,8 +153,8 @@ pc1, pc2 = get_pca_projection(LATENT_DIM)
 
 st.markdown(
     f"""
-This app visualizes a **{LATENT_DIM}D** Variational Autoencoder trained on dog images (128×128 RGB).
-We use **PCA Projection** to map your 2D input to the high-dimensional latent space.
+This app visualizes a **{LATENT_DIM}D** Variational Autoencoder trained on the AFHQ dataset (128x128 RGB).
+The model uses residual blocks and perceptual loss for sharper reconstructions.
 """
 )
 
@@ -147,12 +163,12 @@ st.divider()
 # Sliders for latent space
 col1, col2 = st.columns(2)
 with col1:
-    z1 = st.slider("Principal Component 1", -15.0, 15.0, 0.0, 0.1)
+    z1 = st.slider("Principal Component 1", -20.0, 20.0, 0.0, 0.1)
 with col2:
-    z2 = st.slider("Principal Component 2", -15.0, 15.0, 0.0, 0.1)
+    z2 = st.slider("Principal Component 2", -20.0, 20.0, 0.0, 0.1)
 
 # Generate and Display
-st.subheader("Generated Dog")
+st.subheader("Generated Image")
 
 # Map 2D slider to 128D space
 z_128 = (z1 * pc1) + (z2 * pc2)
@@ -166,4 +182,4 @@ ax.imshow(generated_image)
 ax.axis("off")
 st.pyplot(fig)
 
-st.info(f"💡 Exploring the top 2 principal axes of the {LATENT_DIM}D space.")
+st.info(f"💡 Exploring the top 2 principal axes of the {LATENT_DIM}D latent space.")
