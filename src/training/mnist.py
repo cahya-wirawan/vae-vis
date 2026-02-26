@@ -1,47 +1,39 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision.datasets import MNIST
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
+import argparse
 import os
+import random
+import numpy as np
+from datetime import datetime
 
 # ==========================================
-# 1. Hyperparameters & Setup
-# ==========================================
-BATCH_SIZE = 128
-EPOCHS = 10
-LEARNING_RATE = 1e-3
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-print(f"Training on: {DEVICE}")
-# 1. Override the broken official mirrors with a reliable AWS mirror
-MNIST.mirrors = ["https://ossci-datasets.s3.amazonaws.com/mnist/"]
-
-# Load the MNIST dataset
-transform = transforms.ToTensor()
-train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-
-# ==========================================
-# 2. Define the VAE Architecture
+# 1. Define the VAE Architecture
 # ==========================================
 class VAE(nn.Module):
-    def __init__(self):
+    """
+    VAE for 28x28 MNIST images.
+    Architecture is intentionally kept as Fully Connected layers to match
+    the SimpleDecoder used in the Streamlit visualization app.
+    """
+    def __init__(self, latent_dim=2, hidden_dim1=256, hidden_dim2=128):
         super().__init__()
         
         # ENCODER: Compresses 28x28 image down to hidden layers
-        self.enc_fc1 = nn.Linear(28 * 28, 256)
-        self.enc_fc2 = nn.Linear(256, 128)
+        self.enc_fc1 = nn.Linear(28 * 28, hidden_dim1)
+        self.enc_fc2 = nn.Linear(hidden_dim1, hidden_dim2)
         
-        # Latent Space (2D): Mean and Log-Variance
-        self.fc_mu = nn.Linear(128, 2)
-        self.fc_logvar = nn.Linear(128, 2)
+        # Latent Space: Mean and Log-Variance
+        self.fc_mu = nn.Linear(hidden_dim2, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim2, latent_dim)
         
-        # DECODER: Matches the SimpleDecoder from your Streamlit app
-        self.dec_fc1 = nn.Linear(2, 128)
-        self.dec_fc2 = nn.Linear(128, 256)
-        self.dec_fc3 = nn.Linear(256, 28 * 28)
+        # DECODER: Matches the SimpleDecoder architecture
+        # Note: hidden_dim1/2 are swapped here to mirror the encoder
+        self.dec_fc1 = nn.Linear(latent_dim, hidden_dim2)
+        self.dec_fc2 = nn.Linear(hidden_dim2, hidden_dim1)
+        self.dec_fc3 = nn.Linear(hidden_dim1, 28 * 28)
 
     def encode(self, x):
         h = torch.relu(self.enc_fc1(x))
@@ -56,7 +48,6 @@ class VAE(nn.Module):
     def decode(self, z):
         h = torch.relu(self.dec_fc1(z))
         h = torch.relu(self.dec_fc2(h))
-        # Use sigmoid to ensure pixel values are between 0 and 1
         return torch.sigmoid(self.dec_fc3(h))
 
     def forward(self, x):
@@ -66,50 +57,142 @@ class VAE(nn.Module):
         return reconstructed_x, mu, logvar
 
 # ==========================================
-# 3. Loss Function & Optimizer
+# 2. Loss Function
 # ==========================================
-def vae_loss(reconstructed_x, x, mu, logvar):
-    # 1. Reconstruction Loss (Binary Cross Entropy)
-    BCE = nn.functional.binary_cross_entropy(reconstructed_x, x.view(-1, 28 * 28), reduction='sum')
+def vae_loss(reconstructed_x, x, mu, logvar, beta=1.0):
+    BCE = nn.functional.binary_cross_entropy(reconstructed_x, x.view(-1, 28 * 28), reduction='sum') / x.size(0)
+    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x.size(0)
+    total_loss = BCE + beta * KLD
+    return total_loss, BCE, KLD
+
+def seed_everything(seed):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+def main():
+    parser = argparse.ArgumentParser(description='VAE MNIST Training')
+    parser.add_argument('--batch-size', type=int, default=128, help='Batch size')
+    parser.add_argument('--epochs', type=int, default=20, help='Number of epochs')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--latent-dim', type=int, default=2, help='Latent space dimension')
+    parser.add_argument('--hidden-dim1', type=int, default=256, help='Hidden layer 1 size')
+    parser.add_argument('--hidden-dim2', type=int, default=128, help='Hidden layer 2 size')
+    parser.add_argument('--beta', type=float, default=1.0, help='KL weight factor')
+    parser.add_argument('--kl-warmup', type=int, default=5, help='KL warmup epochs')
+    parser.add_argument('--output-dir', type=str, default='checkpoints_mnist', help='Output directory')
+    parser.add_argument('--num-workers', type=int, default=2, help='DataLoader workers')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--amp', action='store_true', help='Use AMP')
+    parser.add_argument('--clip-grad', type=float, default=1.0, help='Gradient clipping')
+    args = parser.parse_args()
+
+    seed_everything(args.seed)
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🚀 Training on: {device}")
+    if args.amp and device.type != 'cuda':
+        args.amp = False
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(args.output_dir, f"run_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    from torchvision.datasets import MNIST
+    MNIST.mirrors = ["https://ossci-datasets.s3.amazonaws.com/mnist/"]
+
+    transform = transforms.ToTensor()
+    train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
     
-    # 2. KL Divergence
-    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.num_workers,
+        persistent_workers=True if args.num_workers > 0 else False,
+        pin_memory=True if torch.cuda.is_available() else False,
+        worker_init_fn=seed_worker,
+        generator=g,
+        prefetch_factor=2,
+    )
+
+    model = VAE(latent_dim=args.latent_dim, hidden_dim1=args.hidden_dim1, hidden_dim2=args.hidden_dim2).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+
+    model.train()
+    for epoch in range(args.epochs):
+        train_loss = 0
+        train_bce = 0
+        train_kld = 0
+        current_beta = args.beta * min(1.0, epoch / args.kl_warmup) if args.kl_warmup > 0 else args.beta
+
+        for batch_idx, (data, _) in enumerate(train_loader):
+            data = data.to(device)
+            optimizer.zero_grad()
+            
+            with torch.cuda.amp.autocast(enabled=args.amp):
+                recon, mu, logvar = model(data)
+                loss, bce, kld = vae_loss(recon, data, mu, logvar, beta=current_beta)
+            
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+            scaler.step(optimizer)
+            scaler.update()
+            
+            train_loss += loss.item()
+            train_bce += bce.item()
+            train_kld += kld.item()
+            
+        num_batches = len(train_loader)
+        print(f"Epoch [{epoch+1}/{args.epochs}] - Loss: {train_loss/num_batches:.4f} (BCE: {train_bce/num_batches:.4f}, KLD: {train_kld/num_batches:.4f}) Beta: {current_beta:.3f}")
+
+        checkpoint = {
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'args': args
+        }
+        torch.save(checkpoint, os.path.join(run_dir, f"vae_mnist_checkpoint_epoch_{epoch+1}.pth"))
+
+    # Save final decoder weights for Streamlit with metadata
+    decoder_payload = {
+        'metadata': {
+            'latent_dim': args.latent_dim,
+            'hidden_dim1': args.hidden_dim2,  # Swapped to match SimpleDecoder order (latent -> dim1 -> dim2)
+            'hidden_dim2': args.hidden_dim1,
+            'architecture': 'fc_mnist'
+        },
+        'state_dict': {
+            'fc1.weight': model.dec_fc1.weight.detach().cpu(),
+            'fc1.bias': model.dec_fc1.bias.detach().cpu(),
+            'fc2.weight': model.dec_fc2.weight.detach().cpu(),
+            'fc2.bias': model.dec_fc2.bias.detach().cpu(),
+            'fc3.weight': model.dec_fc3.weight.detach().cpu(),
+            'fc3.bias': model.dec_fc3.bias.detach().cpu(),
+        }
+    }
     
-    return BCE + KLD
+    torch.save(decoder_payload, os.path.join(run_dir, 'decoder_weights.pth'))
+    torch.save(decoder_payload, 'decoder_weights.pth')
+    
+    print(f"\n✅ Training complete!")
+    print(f"📦 Checkpoints saved to: {run_dir}")
+    print(f"🎯 Final decoder weights with metadata saved to: decoder_weights.pth")
 
-model = VAE().to(DEVICE)
-optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
-# ==========================================
-# 4. Training Loop
-# ==========================================
-model.train()
-for epoch in range(EPOCHS):
-    train_loss = 0
-    for batch_idx, (data, _) in enumerate(train_loader):
-        data = data.to(DEVICE)
-        
-        optimizer.zero_grad()
-        reconstructed_batch, mu, logvar = model(data)
-        
-        # Calculate loss and backpropagate
-        loss = vae_loss(reconstructed_batch, data, mu, logvar)
-        loss.backward()
-        train_loss += loss.item()
-        optimizer.step()
-        
-    avg_loss = train_loss / len(train_loader.dataset)
-    print(f"Epoch [{epoch+1}/{EPOCHS}] - Average Loss: {avg_loss:.4f}")
-
-# ==========================================
-# 5. Extract and Save Decoder Weights
-# ==========================================
-# We only want to save the decoder parts to load into the Streamlit app
-decoder_state_dict = {
-    'fc1.weight': model.dec_fc1.weight, 'fc1.bias': model.dec_fc1.bias,
-    'fc2.weight': model.dec_fc2.weight, 'fc2.bias': model.dec_fc2.bias,
-    'fc3.weight': model.dec_fc3.weight, 'fc3.bias': model.dec_fc3.bias,
-}
-
-torch.save(decoder_state_dict, 'decoder_weights.pth')
-print("\n✅ Training complete! Saved 'decoder_weights.pth'.")
+if __name__ == "__main__":
+    main()
