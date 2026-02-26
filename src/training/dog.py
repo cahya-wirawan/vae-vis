@@ -10,12 +10,12 @@ import os
 # ==========================================
 # 1. Hyperparameters & Setup
 # ==========================================
-BATCH_SIZE = 64
+BATCH_SIZE = 196
 EPOCHS = 100
 LEARNING_RATE = 2e-4
 LATENT_DIM = 128
 IMG_SIZE = 128
-KL_WEIGHT_MAX = 0.0001   # Very low: prioritize reconstruction quality first
+KL_WEIGHT_MAX = 0.0001  # Very low: prioritize reconstruction quality first
 KL_WARMUP_EPOCHS = 30
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SAMPLE_DIR = "samples"
@@ -29,18 +29,22 @@ dataset = load_dataset("huggan/AFHQ", split="train")
 print(f"Dataset size: {len(dataset)} images")
 
 # Data augmentation (lighter — dataset is much larger now)
-transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.RandomHorizontalFlip(),
-    transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
-    transforms.ToTensor(),
-])
+transform = transforms.Compose(
+    [
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+        transforms.ToTensor(),
+    ]
+)
 
 # Clean transform for visualization
-transform_clean = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.ToTensor(),
-])
+transform_clean = transforms.Compose(
+    [
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+    ]
+)
 
 
 def transform_fn(examples):
@@ -52,7 +56,15 @@ def transform_fn(examples):
 
 
 dataset.set_transform(transform_fn)
-train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+train_loader = DataLoader(
+    dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    drop_last=True,
+    num_workers=4,
+    pin_memory=True,
+    prefetch_factor=2,
+)
 
 
 # ==========================================
@@ -61,17 +73,22 @@ train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_las
 class VGGPerceptualLoss(nn.Module):
     """Compares VGG19 features between prediction and target.
     This penalizes blurriness at the feature level."""
+
     def __init__(self):
         super().__init__()
         vgg = models.vgg19(weights=models.VGG19_Weights.DEFAULT).features
-        self.slice1 = nn.Sequential(*list(vgg[:4]))    # relu1_2
-        self.slice2 = nn.Sequential(*list(vgg[4:9]))   # relu2_2
+        self.slice1 = nn.Sequential(*list(vgg[:4]))  # relu1_2
+        self.slice2 = nn.Sequential(*list(vgg[4:9]))  # relu2_2
         self.slice3 = nn.Sequential(*list(vgg[9:18]))  # relu3_4
-        self.slice4 = nn.Sequential(*list(vgg[18:27])) # relu4_4
+        self.slice4 = nn.Sequential(*list(vgg[18:27]))  # relu4_4
         for param in self.parameters():
             param.requires_grad = False
-        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        self.register_buffer(
+            "mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        )
 
     def normalize(self, x):
         return (x - self.mean) / self.std
@@ -94,6 +111,7 @@ class VGGPerceptualLoss(nn.Module):
 # ==========================================
 class ResBlock(nn.Module):
     """Residual block: adds input back to output for better gradient flow."""
+
     def __init__(self, channels):
         super().__init__()
         self.block = nn.Sequential(
@@ -111,6 +129,7 @@ class ResBlock(nn.Module):
 
 class Encoder(nn.Module):
     """Downsamples 3x128x128 → flat vector. No skip connections stored."""
+
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
@@ -146,35 +165,36 @@ class Encoder(nn.Module):
 
 class Decoder(nn.Module):
     """Upsamples 512x4x4 → 3x128x128. All information comes from latent z only."""
+
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
             # 512x4x4 -> 512x8x8
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             nn.Conv2d(512, 512, 3, padding=1),
             nn.BatchNorm2d(512),
             nn.ReLU(),
             ResBlock(512),
             # 512x8x8 -> 256x16x16
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             nn.Conv2d(512, 256, 3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(),
             ResBlock(256),
             # 256x16x16 -> 128x32x32
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             nn.Conv2d(256, 128, 3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(),
             ResBlock(128),
             # 128x32x32 -> 64x64x64
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             nn.Conv2d(128, 64, 3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             ResBlock(64),
             # 64x64x64 -> 3x128x128
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             nn.Conv2d(64, 32, 3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
@@ -209,7 +229,7 @@ class VAE(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, a=0.2, nonlinearity='leaky_relu')
+                nn.init.kaiming_normal_(m.weight, a=0.2, nonlinearity="leaky_relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
