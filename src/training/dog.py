@@ -17,6 +17,8 @@ LATENT_DIM = 128
 IMG_SIZE = 128
 KL_WEIGHT_MAX = 0.005
 KL_WARMUP_EPOCHS = 20    # Faster warmup — more data stabilizes training quicker
+SKIP_DROP_PROB = 0.3     # Probability of zeroing skip connections during training
+                         # Forces decoder to learn generation without encoder features
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SAMPLE_DIR = "samples"
 
@@ -209,31 +211,40 @@ class VAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
+    def _zero_skips(self, z):
+        """Create zero tensors matching skip connection shapes."""
+        b = z.shape[0]
+        return [
+            torch.zeros(b, 64, 64, 64, device=z.device),
+            torch.zeros(b, 128, 32, 32, device=z.device),
+            torch.zeros(b, 256, 16, 16, device=z.device),
+            torch.zeros(b, 512, 8, 8, device=z.device),
+        ]
+
     def decode(self, z, skips=None):
         h = self.decoder_fc(z)
         h = h.view(-1, 512, 4, 4)
 
-        if skips is not None:
-            s1, s2, s3, s4 = skips
-            h = self.dec5(h, s4)   # 4->8,  use enc4
-            h = self.dec4(h, s3)   # 8->16, use enc3
-            h = self.dec3(h, s2)   # 16->32, use enc2
-            h = self.dec2(h, s1)   # 32->64, use enc1
-        else:
-            # For generation without encoder (sampling from latent space)
-            # Use zeros as skip connections
-            b = z.shape[0]
-            h = self.dec5(h, torch.zeros(b, 512, 8, 8, device=z.device))
-            h = self.dec4(h, torch.zeros(b, 256, 16, 16, device=z.device))
-            h = self.dec3(h, torch.zeros(b, 128, 32, 32, device=z.device))
-            h = self.dec2(h, torch.zeros(b, 64, 64, 64, device=z.device))
+        if skips is None:
+            skips = self._zero_skips(z)
 
+        s1, s2, s3, s4 = skips
+        h = self.dec5(h, s4)   # 4->8
+        h = self.dec4(h, s3)   # 8->16
+        h = self.dec3(h, s2)   # 16->32
+        h = self.dec2(h, s1)   # 32->64
         h = self.dec1(h)       # 64->128
         return h
 
-    def forward(self, x):
+    def forward(self, x, skip_drop_prob=0.0):
         mu, logvar, skips = self.encode(x)
         z = self.reparameterize(mu, logvar)
+
+        # Skip dropout: randomly zero all skips to train the decoder
+        # to produce good output without encoder features
+        if self.training and skip_drop_prob > 0 and torch.rand(1).item() < skip_drop_prob:
+            skips = self._zero_skips(z)
+
         return self.decode(z, skips), mu, logvar
 
 
@@ -310,7 +321,7 @@ for epoch in range(EPOCHS):
             viz_batch = data.clone()
 
         optimizer.zero_grad()
-        reconstructed_batch, mu, logvar = model(data)
+        reconstructed_batch, mu, logvar = model(data, skip_drop_prob=SKIP_DROP_PROB)
 
         loss, l1_val, perc_val, kld_val = vae_loss(
             reconstructed_batch, data, mu, logvar, perceptual_loss_fn, kl_weight
