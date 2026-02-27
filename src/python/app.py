@@ -154,3 +154,72 @@ else:
     ax.imshow(generated_image, cmap="magma", interpolation="bilinear")
 ax.axis("off")
 st.pyplot(fig)
+
+# ==========================================
+# 4. Latent Space Grid (10x10)
+# ==========================================
+st.divider()
+st.subheader("🌐 10x10 Latent Space Grid")
+grid_range = st.slider("Grid Sweep Range", 1.0, 10.0, 3.0, 0.5)
+
+@st.cache_data
+def generate_grid_image(_decoder, _latent_dim, _is_rgb, _pc1=None, _pc2=None, steps=10, r=3.0):
+    """Generates a large grid image by sampling the latent space."""
+    vals = np.linspace(-r, r, steps)
+    grid_latents = []
+    
+    # Create the batch of latent vectors
+    for y in reversed(vals): # Reverse y so + is up
+        for x in vals:
+            if _pc1 is not None:
+                # High-D PCA projection
+                z = (x * _pc1) + (y * _pc2)
+                grid_latents.append(z)
+            else:
+                # Direct 2D
+                grid_latents.append([x, y])
+    
+    z_tensor = torch.tensor(np.array(grid_latents), dtype=torch.float32)
+    
+    with torch.no_grad():
+        # Batch inference for speed
+        samples = _decoder(z_tensor).cpu().numpy()
+    
+    # Tiling logic
+    # samples shape: (100, H, W, C) for RGB or (100, H, W) for Grayscale
+    img_h, img_w = samples.shape[1], samples.shape[2]
+    
+    if _is_rgb:
+        grid_img = np.zeros((steps * img_h, steps * img_w, 3))
+    else:
+        grid_img = np.zeros((steps * img_h, steps * img_w))
+        
+    for i in range(steps):
+        for j in range(steps):
+            idx = i * steps + j
+            if _is_rgb:
+                grid_img[i*img_h:(i+1)*img_h, j*img_w:(j+1)*img_w, :] = samples[idx]
+            else:
+                grid_img[i*img_h:(i+1)*img_h, j*img_w:(j+1)*img_w] = samples[idx]
+                
+    return grid_img
+
+# Handle projection args
+proj_args = {}
+if latent_dim > 2:
+    pc1, pc2 = get_pca_projection(latent_dim)
+    proj_args = {'_pc1': pc1, '_pc2': pc2}
+
+grid_img = generate_grid_image(
+    decoder, latent_dim, is_rgb, steps=10, r=grid_range, **proj_args
+)
+
+fig_grid, ax_grid = plt.subplots(figsize=(10, 10))
+if is_rgb:
+    ax_grid.imshow(grid_img)
+else:
+    ax_grid.imshow(grid_img, cmap="magma")
+ax_grid.axis("off")
+st.pyplot(fig_grid)
+
+st.caption(f"Showing a 10x10 sweep from -{grid_range} to +{grid_range} along the top 2 principal components.")
