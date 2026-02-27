@@ -140,7 +140,6 @@ else:
 
 # 3. Generate and Display
 st.subheader("Generated Output")
-z_tensor = torch.tensor([z_values], dtype=torch.float32)
 
 with torch.no_grad():
     # Model forward pass
