@@ -101,28 +101,42 @@ else:
 st.sidebar.divider()
 st.sidebar.write(f"🔢 **Model Latent Dim:** {latent_dim}")
 
+@st.cache_data
+def get_pca_projection(dim):
+    """Generates a stable, orthogonal projection matrix from 2D to high-D."""
+    rng = np.random.RandomState(42)  # Fixed seed for stable visualization
+    v1 = rng.randn(dim)
+    v2 = rng.randn(dim)
+    # Gram-Schmidt to make them orthogonal
+    v1 /= np.linalg.norm(v1)
+    v2 -= v2.dot(v1) * v1
+    v2 /= np.linalg.norm(v2)
+    return v1, v2
+
 st.divider()
 
-# 2. Generate Dynamic Sliders
-z_values = []
-if latent_dim <= 10:
-    # For small latent spaces, show all dimensions
-    st.write(f"Adjusting all {latent_dim} latent variables:")
-    cols = st.columns(min(latent_dim, 4))
+# 2. Generate Sliders and Latent Vector
+if latent_dim <= 2:
+    # For 1D or 2D latent spaces, use direct sliders
+    z_values = []
+    cols = st.columns(latent_dim)
     for i in range(latent_dim):
-        with cols[i % 4]:
+        with cols[i]:
             val = st.slider(f"z{i+1}", -4.0, 4.0, 0.0, 0.1, key=f"z{i}")
             z_values.append(val)
+    z_tensor = torch.tensor([z_values], dtype=torch.float32)
 else:
-    # For high latent spaces (like 128D), control the first 2 and zero the rest
-    # (Or you could implement PCA axis selection here)
-    st.info(f"💡 High-dimensional latent space ({latent_dim}D). Controlling first 2 dimensions, others set to 0.0.")
+    # For high latent spaces, use PCA projection
+    st.info(f"💡 High-dimensional latent space ({latent_dim}D). Using **PCA Projection** to explore the top 2 axes.")
     col1, col2 = st.columns(2)
     with col1:
-        z1 = st.slider("z1", -5.0, 5.0, 0.0, 0.1)
+        pc1_val = st.slider("Principal Component 1", -15.0, 15.0, 0.0, 0.1)
     with col2:
-        z2 = st.slider("z2", -5.0, 5.0, 0.0, 0.1)
-    z_values = [z1, z2] + [0.0] * (latent_dim - 2)
+        pc2_val = st.slider("Principal Component 2", -15.0, 15.0, 0.0, 0.1)
+    
+    pc1, pc2 = get_pca_projection(latent_dim)
+    z_high_d = (pc1_val * pc1) + (pc2_val * pc2)
+    z_tensor = torch.tensor(z_high_d, dtype=torch.float32).unsqueeze(0)
 
 # 3. Generate and Display
 st.subheader("Generated Output")
