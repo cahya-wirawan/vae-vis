@@ -16,6 +16,7 @@ LEARNING_RATE = 2e-4
 LATENT_DIM = 256
 IMG_SIZE = 128
 KL_WEIGHT_MAX = 0.0001  # Very low: prioritize reconstruction quality first
+KL_WEIGHT_MIN = None  # Set when resuming to ramp from old KL weight (e.g. 0.0001) to KL_WEIGHT_MAX
 KL_WARMUP_EPOCHS = 30
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SAMPLE_DIR = "samples"
@@ -352,6 +353,10 @@ for epoch in range(start_epoch, EPOCHS):
     num_batches = 0
 
     kl_weight = min(1.0, epoch / KL_WARMUP_EPOCHS) * KL_WEIGHT_MAX
+    # Gradual KL ramp when resuming with a higher KL_WEIGHT_MAX
+    if KL_WEIGHT_MIN is not None and start_epoch > 0:
+        ramp_progress = min(1.0, (epoch - start_epoch) / KL_WARMUP_EPOCHS)
+        kl_weight = KL_WEIGHT_MIN + (KL_WEIGHT_MAX - KL_WEIGHT_MIN) * ramp_progress
 
     for batch in train_loader:
         data = batch["pixel_values"].to(DEVICE)
