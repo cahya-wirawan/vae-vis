@@ -251,9 +251,10 @@ def ssim(
     Returns a scalar loss = 1 - SSIM (so lower is better)."""
     kernel_1d = _fspecial_gauss_1d(window_size, 1.5).to(x.device, x.dtype)
     C = x.shape[1]  # channels
-    # Build separable 2-D Gaussian per channel
-    kernel_2d = kernel_1d.T @ kernel_1d  # size x size
-    window = kernel_2d.expand(C, 1, window_size, window_size).contiguous()
+    # Build 2-D Gaussian via outer product: (1,1,N) → (N,) outer (N,) → (N,N)
+    k = kernel_1d.squeeze()  # (N,)
+    kernel_2d = k.unsqueeze(1) @ k.unsqueeze(0)  # (N, N)
+    window = kernel_2d.unsqueeze(0).unsqueeze(0).expand(C, 1, window_size, window_size).contiguous()
     pad = window_size // 2
 
     mu_x = nn.functional.conv2d(x, window, padding=pad, groups=C)
@@ -864,13 +865,12 @@ def main():
     # ── Callbacks ─────────────────────────────────────────
     callbacks = [
         LearningRateMonitor(logging_interval="epoch"),
-        # Periodic checkpoints (keep last 3)
+        # Periodic checkpoints (save all periodic, keep last 3 via save_top_k=-1)
         ModelCheckpoint(
             dirpath=os.path.join(out_dir, "checkpoints"),
             filename="epoch_{epoch:04d}",
             every_n_epochs=args.save_every,
-            save_top_k=3,
-            monitor=None,  # No metric → keeps last 3 periodic saves
+            save_top_k=-1,  # Keep all periodic saves
             save_last=True,
         ),
         # Best model by total loss
