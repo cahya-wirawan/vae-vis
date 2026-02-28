@@ -275,7 +275,7 @@ def ssim(
 # ==========================================
 def vae_loss(
     reconstructed_x, x, mu, logvar, perceptual_fn,
-    kl_weight=1.0, perc_weight=0.5, ssim_weight=0.1,
+    kl_weight=1.0, perc_weight=0.5, ssim_weight=0.1, free_bits=0.0,
 ):
     # L1 pixel loss (averaged over all elements)
     L1 = nn.functional.l1_loss(reconstructed_x, x, reduction="mean")
@@ -287,13 +287,21 @@ def vae_loss(
     SSIM_LOSS = ssim(reconstructed_x, x) if ssim_weight > 0 else torch.tensor(0.0)
 
     # KL Divergence — normalised per data dimension for scale-invariance
-    # sum over latent dims, mean over batch, then divide by pixel count
-    # so recon and KL are both "per pixel" and comparable across resolutions
     logvar_safe = torch.clamp(logvar, min=-10.0, max=10.0)
     n_pixels = reconstructed_x.shape[1] * reconstructed_x.shape[2] * reconstructed_x.shape[3]
-    KLD = -0.5 * torch.sum(1 + logvar_safe - mu.pow(2) - logvar_safe.exp()) / (
-        mu.shape[0] * n_pixels
-    )
+
+    if free_bits > 0:
+        # Free bits (Kingma et al., 2016): clamp KL per latent dimension to a
+        # minimum of `free_bits` nats. Prevents posterior collapse by ensuring
+        # each dimension is "used" before it contributes to the KL gradient.
+        kl_per_dim = -0.5 * (1 + logvar_safe - mu.pow(2) - logvar_safe.exp())  # (B, D)
+        kl_per_dim = kl_per_dim.mean(dim=0)  # (D,)  average over batch
+        kl_clamped = torch.clamp(kl_per_dim, min=free_bits)  # (D,)
+        KLD = kl_clamped.sum() / n_pixels
+    else:
+        KLD = -0.5 * torch.sum(1 + logvar_safe - mu.pow(2) - logvar_safe.exp()) / (
+            mu.shape[0] * n_pixels
+        )
 
     recon_loss = L1 + perc_weight * P_LOSS + ssim_weight * SSIM_LOSS
     total = recon_loss + kl_weight * KLD
@@ -401,6 +409,8 @@ class VAELightningModule(pl.LightningModule):
         kl_weight_max=0.0001,
         kl_weight_min=None,
         kl_warmup_epochs=30,
+        kl_cycles=1,
+        free_bits=0.0,
         perc_weight=0.5,
         perc_warmup_epochs=50,
         ssim_weight=0.1,
@@ -431,11 +441,20 @@ class VAELightningModule(pl.LightningModule):
         epoch = self.current_epoch
         hp = self.hparams
 
-        # KL weight warmup
-        kl_weight = min(1.0, epoch / max(1, hp.kl_warmup_epochs)) * hp.kl_weight_max
-        if hp.kl_weight_min is not None:
+        # KL weight schedule
+        if hp.kl_cycles > 1:
+            # Cyclical annealing (Fu et al., 2019): repeat warmup ramp
+            # multiple times so the encoder re-learns useful representations
+            # after each regularisation phase.
+            cycle_len = hp.epochs / hp.kl_cycles
+            epoch_in_cycle = epoch % cycle_len
+            warmup_in_cycle = min(cycle_len, hp.kl_warmup_epochs)
+            kl_weight = min(1.0, epoch_in_cycle / max(1, warmup_in_cycle)) * hp.kl_weight_max
+        elif hp.kl_weight_min is not None:
             ramp = min(1.0, epoch / max(1, hp.kl_warmup_epochs))
             kl_weight = hp.kl_weight_min + (hp.kl_weight_max - hp.kl_weight_min) * ramp
+        else:
+            kl_weight = min(1.0, epoch / max(1, hp.kl_warmup_epochs)) * hp.kl_weight_max
 
         # Perceptual weight ramp: 0 → perc_weight over perc_warmup_epochs
         perc_weight = min(1.0, epoch / max(1, hp.perc_warmup_epochs)) * hp.perc_weight
@@ -460,6 +479,7 @@ class VAELightningModule(pl.LightningModule):
             kl_weight=self._kl_weight,
             perc_weight=self._perc_weight,
             ssim_weight=self.hparams.ssim_weight,
+            free_bits=self.hparams.free_bits,
         )
 
         # Log all metrics (sync_dist=True for DDP correctness)
@@ -662,6 +682,15 @@ def parse_args():
         help="Starting KL weight (ramps to --kl-weight-max over warmup)",
     )
     parser.add_argument("--kl-warmup-epochs", type=int, default=30)
+    parser.add_argument(
+        "--kl-cycles", type=int, default=1,
+        help="Cyclical KL annealing cycles (1=monotonic, >1=repeat warmup N times)",
+    )
+    parser.add_argument(
+        "--free-bits", type=float, default=0.0,
+        help="Free bits per latent dim (Kingma 2016, e.g. 0.25). Prevents posterior "
+             "collapse by setting a KL floor per dimension. 0=disabled.",
+    )
 
     # Loss weights
     parser.add_argument(
@@ -782,6 +811,8 @@ def main():
         kl_weight_max=args.kl_weight_max,
         kl_weight_min=args.kl_weight_min,
         kl_warmup_epochs=args.kl_warmup_epochs,
+        kl_cycles=args.kl_cycles,
+        free_bits=args.free_bits,
         perc_weight=args.perc_weight,
         perc_warmup_epochs=args.perc_warmup_epochs,
         ssim_weight=args.ssim_weight,
