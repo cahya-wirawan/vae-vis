@@ -32,8 +32,8 @@
         </div>
 
         <div class="grid-container">
-            <h3>4x4 Latent Grid (-2.0 to 2.0)</h3>
-            <canvas id="grid-canvas" width="112" height="112" style="width: 280px; height: 280px;"></canvas>
+            <h3>10x10 Latent Grid (-2.0 to 2.0)</h3>
+            <canvas id="grid-canvas" width="280" height="280" style="width: 280px; height: 280px;"></canvas>
         </div>
     </div>
 
@@ -70,12 +70,12 @@
             const gridCtx = gridCanvas.getContext('2d');
 
             function renderGrid() {
-                const steps = 4;
+                const steps = 10;
                 const pixels = decoder.generate_grid(steps, -2.0, 2.0);
-                const fullImageData = gridCtx.createImageData(112, 112);
+                const fullImageData = gridCtx.createImageData(280, 280);
                 
-                // The pixels are returned as a flat array of 16 images (28x28 each)
-                // We need to map them to the 112x112 grid canvas
+                // The pixels are returned as a flat array of 100 images (28x28 each)
+                // We need to map them to the 280x280 grid canvas
                 for (let row = 0; row < steps; row++) {
                     for (let col = 0; col < steps; col++) {
                         const imgIdx = row * steps + col;
@@ -84,10 +84,10 @@
                         for (let y = 0; y < 28; y++) {
                             for (let x = 0; x < 28; x++) {
                                 const val = pixels[imgStart + y * 28 + x];
-                                // Calculate position in the 112x112 canvas
+                                // Calculate position in the 280x280 canvas
                                 const canvasX = col * 28 + x;
                                 const canvasY = row * 28 + y;
-                                const canvasIdx = (canvasY * 112 + canvasX) * 4;
+                                const canvasIdx = (canvasY * 280 + canvasX) * 4;
                                 
                                 fullImageData.data[canvasIdx] = val;
                                 fullImageData.data[canvasIdx+1] = val;

@@ -11,15 +11,16 @@ import os
 # 1. Hyperparameters & Setup
 # ==========================================
 BATCH_SIZE = 196
-EPOCHS = 100
+EPOCHS = 500
 LEARNING_RATE = 2e-4
-LATENT_DIM = 128
+LATENT_DIM = 256
 IMG_SIZE = 128
 KL_WEIGHT_MAX = 0.0001  # Very low: prioritize reconstruction quality first
 KL_WARMUP_EPOCHS = 30
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SAMPLE_DIR = "samples"
-RESUME_FROM = None  # Set to checkpoint path to resume, e.g. "dog_vae_128_checkpoint.pth"
+RESUME_FROM = None  # Set to checkpoint path to resume, e.g. f"dog_vae_{LATENT_DIM}_checkpoint.pth"
+RESET_LR = False  # When True, restart LR schedule from LEARNING_RATE (ignore checkpoint's LR)
 
 os.makedirs(SAMPLE_DIR, exist_ok=True)
 print(f"Training on: {DEVICE}")
@@ -302,7 +303,16 @@ if RESUME_FROM and os.path.isfile(RESUME_FROM):
     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     start_epoch = checkpoint["epoch"] + 1
     best_loss = checkpoint.get("best_loss", float("inf"))
-    print(f"Resuming from epoch {start_epoch}, best_loss: {best_loss:.6f}")
+    if RESET_LR:
+        # Override with fresh LR schedule while keeping optimizer momentum
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = LEARNING_RATE
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=EPOCHS - start_epoch, eta_min=1e-6
+        )
+        print(f"Resuming from epoch {start_epoch}, best_loss: {best_loss:.6f}, LR reset to {LEARNING_RATE}")
+    else:
+        print(f"Resuming from epoch {start_epoch}, best_loss: {best_loss:.6f}")
 else:
     if RESUME_FROM:
         print(f"WARNING: Checkpoint '{RESUME_FROM}' not found, training from scratch.")
@@ -393,17 +403,17 @@ for epoch in range(start_epoch, EPOCHS):
         "scheduler_state_dict": scheduler.state_dict(),
         "best_loss": best_loss,
     }
-    torch.save(checkpoint_data, "dog_vae_128_checkpoint.pth")
+    torch.save(checkpoint_data, f"dog_vae_{LATENT_DIM}_checkpoint.pth")
 
     # Save best model
     if avg_loss < best_loss:
         best_loss = avg_loss
-        torch.save(model.state_dict(), "dog_vae_128_best.pth")
+        torch.save(model.state_dict(), f"dog_vae_{LATENT_DIM}_best.pth")
 
 # ==========================================
 # 7. Save Final Weights
 # ==========================================
-torch.save(model.state_dict(), "dog_vae_128.pth")
+torch.save(model.state_dict(), f"dog_vae_{LATENT_DIM}.pth")
 print(f"\n✅ Training complete! Best loss: {best_loss:.6f}")
-print(f"Model saved: dog_vae_128.pth / dog_vae_128_best.pth")
+print(f"Model saved: dog_vae_{LATENT_DIM}.pth / dog_vae_{LATENT_DIM}_best.pth")
 print(f"Sample images in: {SAMPLE_DIR}/")
