@@ -71,14 +71,16 @@ class DogDecoder(nn.Module):
             nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.Conv2d(32, 3, 3, padding=1),
-            nn.Sigmoid(),
+            nn.Tanh(),
         )
 
     def forward(self, z):
         h = self.decoder_fc(z)
         h = h.view(-1, 512, 4, 4)
         x = self.decoder_net(h)
-        return x.squeeze(0).permute(1, 2, 0)
+        # Denormalize from [-1,1] to [0,1] for display
+        x = x * 0.5 + 0.5
+        return x.squeeze(0).permute(1, 2, 0).clamp(0, 1)
 
 # ==========================================
 # 2. Build the Web App Interface
