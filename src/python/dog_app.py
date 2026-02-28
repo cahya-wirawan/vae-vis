@@ -101,6 +101,8 @@ def load_dog_model():
         'src/training/dog_vae_128_best.pth',
         'src/python/dog_vae_128.pth',
         '../training/dog_vae_128.pth',
+        # Also search for Lightning .ckpt best models in runs/
+        'dog_vae_128_best.ckpt',
     ]
 
     loaded = False
@@ -110,7 +112,17 @@ def load_dog_model():
             
         try:
             # Setting weights_only=True fixes the 'torch.classes' error in Streamlit
-            state_dict = torch.load(path, map_location='cpu', weights_only=True)
+            state_dict = torch.load(path, map_location='cpu', weights_only=False)
+
+            # Handle Lightning .ckpt format (state_dict nested under 'state_dict' key)
+            if isinstance(state_dict, dict) and 'state_dict' in state_dict:
+                # Lightning wraps model as vae.* inside the LightningModule
+                raw = state_dict['state_dict']
+                state_dict = {
+                    k.replace('vae.', ''): v
+                    for k, v in raw.items()
+                    if k.startswith('vae.')
+                } or raw
 
             # Filter and remap keys to match DogDecoder structure
             # trained: decoder.net.0... -> app: decoder_net.0...

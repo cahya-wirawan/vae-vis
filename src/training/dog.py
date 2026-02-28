@@ -1,25 +1,25 @@
 import argparse
-import glob
-import math
 import os
 import random
 from datetime import datetime
 
 import numpy as np
+import pytorch_lightning as pl
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.amp import GradScaler, autocast
-from torch.utils.tensorboard import SummaryWriter
 from datasets import load_dataset
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader
 from torchvision import models, transforms
 from torchvision.utils import make_grid, save_image
 
 try:
     import wandb as _wandb
+    from pytorch_lightning.loggers import WandbLogger as _WandbLogger
 except ImportError:
     _wandb = None
+    _WandbLogger = None
 
 
 # ==========================================
@@ -303,11 +303,348 @@ def vae_loss(
 
 
 # ==========================================
-# 4. CLI Arguments
+# 5. Visualization Helpers
+# ==========================================
+@torch.no_grad()
+def _latent_interpolation(model, latent_dim, device, n_pairs=2, n_steps=8):
+    """Spherical linear interpolation between random z pairs.
+    Returns a (n_pairs*n_steps) batch of decoded images in [0,1]."""
+    images = []
+    for _ in range(n_pairs):
+        z0 = torch.randn(latent_dim, device=device)
+        z1 = torch.randn(latent_dim, device=device)
+        z0_n = z0 / z0.norm()
+        z1_n = z1 / z1.norm()
+        omega = torch.acos(torch.clamp(torch.dot(z0_n, z1_n), -1.0, 1.0))
+        sin_omega = torch.sin(omega).clamp(min=1e-6)
+        for t in torch.linspace(0, 1, n_steps):
+            z_t = (torch.sin((1 - t) * omega) / sin_omega) * z0 + (
+                torch.sin(t * omega) / sin_omega
+            ) * z1
+            images.append(model.decode(z_t.unsqueeze(0)))
+    return torch.cat(images, dim=0) * 0.5 + 0.5  # [-1,1] → [0,1]
+
+
+# ==========================================
+# 6. Data Module
+# ==========================================
+class AFHQDataModule(pl.LightningDataModule):
+    def __init__(self, img_size=128, batch_size=196, num_workers=4, seed=None):
+        super().__init__()
+        self.save_hyperparameters()
+        self.dataset = None
+
+    def setup(self, stage=None):
+        if self.dataset is not None:
+            return
+        print("Loading huggan/AFHQ dataset...")
+        self.dataset = load_dataset("huggan/AFHQ", split="train")
+        print(f"Dataset size: {len(self.dataset)} images")
+
+        img_size = self.hparams.img_size
+        self.aug_transform = transforms.Compose(
+            [
+                transforms.Resize((img_size, img_size)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
+        )
+
+        def transform_fn(examples):
+            examples["pixel_values"] = [
+                self.aug_transform(image.convert("RGB"))
+                for image in examples["image"]
+            ]
+            del examples["image"]
+            return examples
+
+        self.dataset.set_transform(transform_fn)
+
+    def train_dataloader(self):
+        generator = None
+        worker_init_fn = None
+        seed = self.hparams.seed
+
+        if seed is not None:
+            generator = torch.Generator()
+            generator.manual_seed(seed)
+
+            def worker_init_fn(worker_id):
+                worker_seed = seed + worker_id
+                np.random.seed(worker_seed)
+                random.seed(worker_seed)
+
+        return DataLoader(
+            self.dataset,
+            batch_size=self.hparams.batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=self.hparams.num_workers,
+            pin_memory=True,
+            prefetch_factor=2,
+            generator=generator,
+            worker_init_fn=worker_init_fn,
+        )
+
+
+# ==========================================
+# 7. Lightning Module
+# ==========================================
+class VAELightningModule(pl.LightningModule):
+    def __init__(
+        self,
+        latent_dim=256,
+        lr=2e-4,
+        epochs=500,
+        kl_weight_max=0.0001,
+        kl_weight_min=None,
+        kl_warmup_epochs=30,
+        perc_weight=0.5,
+        perc_warmup_epochs=50,
+        ssim_weight=0.1,
+        sample_dir="samples",
+        fid_every=0,
+        fid_n_samples=1000,
+        batch_size=196,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.vae = VAE(latent_dim)
+        self.perceptual_loss_fn = VGGPerceptualLoss()
+
+        self.viz_batch = None
+        self._kl_weight = 0.0
+        self._perc_weight = 0.0
+
+    def forward(self, x):
+        return self.vae(x)
+
+    def decode(self, z):
+        return self.vae.decode(z)
+
+    # ── Schedule ──────────────────────────────────────────
+    def _compute_schedule_weights(self):
+        """Compute KL and perceptual weights for the current epoch."""
+        epoch = self.current_epoch
+        hp = self.hparams
+
+        # KL weight warmup
+        kl_weight = min(1.0, epoch / max(1, hp.kl_warmup_epochs)) * hp.kl_weight_max
+        if hp.kl_weight_min is not None:
+            ramp = min(1.0, epoch / max(1, hp.kl_warmup_epochs))
+            kl_weight = hp.kl_weight_min + (hp.kl_weight_max - hp.kl_weight_min) * ramp
+
+        # Perceptual weight ramp: 0 → perc_weight over perc_warmup_epochs
+        perc_weight = min(1.0, epoch / max(1, hp.perc_warmup_epochs)) * hp.perc_weight
+
+        self._kl_weight = kl_weight
+        self._perc_weight = perc_weight
+
+    def on_train_epoch_start(self):
+        self._compute_schedule_weights()
+
+    # ── Training ──────────────────────────────────────────
+    def training_step(self, batch, batch_idx):
+        data = batch["pixel_values"]
+
+        # Capture first batch for fixed visualization
+        if self.viz_batch is None:
+            self.viz_batch = data[:8].clone()
+
+        recon, mu, logvar = self.vae(data)
+        loss, l1_val, perc_val, kld_val, ssim_val = vae_loss(
+            recon, data, mu, logvar, self.perceptual_loss_fn,
+            kl_weight=self._kl_weight,
+            perc_weight=self._perc_weight,
+            ssim_weight=self.hparams.ssim_weight,
+        )
+
+        # Log all metrics (sync_dist=True for DDP correctness)
+        self.log("loss/total", loss, prog_bar=True, sync_dist=True)
+        self.log("loss/L1", l1_val, sync_dist=True)
+        self.log("loss/perceptual", perc_val, sync_dist=True)
+        self.log("loss/SSIM", ssim_val, sync_dist=True)
+        self.log("loss/KLD", kld_val, sync_dist=True)
+        self.log("schedule/kl_weight", self._kl_weight)
+        self.log("schedule/perc_weight", self._perc_weight)
+
+        return loss
+
+    def on_before_optimizer_step(self, optimizer):
+        """Log gradient norm before optimizer step."""
+        total_norm_sq = 0.0
+        for p in self.vae.parameters():
+            if p.grad is not None:
+                total_norm_sq += p.grad.data.norm(2).item() ** 2
+        self.log("grad/norm", total_norm_sq ** 0.5)
+
+    # ── Epoch-end hooks ───────────────────────────────────
+    def on_train_epoch_end(self):
+        epoch = self.current_epoch
+        hp = self.hparams
+
+        if (epoch + 1) % 5 == 0:
+            print(
+                f"Epoch [{epoch+1}/{hp.epochs}] | "
+                f"KL_w: {self._kl_weight:.5f} | P_w: {self._perc_weight:.3f}"
+            )
+
+        # Save visualization every 25 epochs (rank 0 only)
+        if (epoch + 1) % 25 == 0 and self.viz_batch is not None:
+            if self.global_rank == 0:
+                self._save_visualization(epoch)
+
+        # FID / LPIPS evaluation
+        if hp.fid_every > 0 and (epoch + 1) % hp.fid_every == 0:
+            if self.global_rank == 0:
+                self._compute_fid_lpips(epoch)
+
+    # ── Visualization ─────────────────────────────────────
+    @torch.no_grad()
+    def _save_visualization(self, epoch):
+        """Save recon grid, random samples, and slerp interpolation."""
+        self.vae.eval()
+        device = self.viz_batch.device
+        latent_dim = self.hparams.latent_dim
+        sample_dir = self.hparams.sample_dir
+        os.makedirs(sample_dir, exist_ok=True)
+
+        recon, _, _ = self.vae(self.viz_batch)
+        orig_vis = self.viz_batch * 0.5 + 0.5
+        recon_vis = recon * 0.5 + 0.5
+        comparison = torch.cat([orig_vis, recon_vis], dim=0)
+        save_image(
+            comparison,
+            os.path.join(sample_dir, f"recon_epoch_{epoch+1:04d}.png"),
+            nrow=8,
+        )
+
+        z_random = torch.randn(8, latent_dim, device=device)
+        gen_vis = self.vae.decode(z_random) * 0.5 + 0.5
+        save_image(
+            gen_vis,
+            os.path.join(sample_dir, f"gen_epoch_{epoch+1:04d}.png"),
+            nrow=8,
+        )
+
+        interp_grid = _latent_interpolation(self.vae, latent_dim, device, n_steps=8)
+        save_image(
+            interp_grid,
+            os.path.join(sample_dir, f"interp_epoch_{epoch+1:04d}.png"),
+            nrow=8,
+        )
+
+        # Log images to all loggers
+        for logger in self.loggers:
+            if isinstance(logger, TensorBoardLogger):
+                writer = logger.experiment
+                writer.add_image(
+                    "samples/reconstruction", make_grid(comparison, nrow=8), epoch
+                )
+                writer.add_image(
+                    "samples/random", make_grid(gen_vis, nrow=8), epoch
+                )
+                writer.add_image(
+                    "samples/interpolation", make_grid(interp_grid, nrow=8), epoch
+                )
+            if _WandbLogger is not None and isinstance(logger, _WandbLogger):
+                logger.experiment.log(
+                    {
+                        "samples/reconstruction": _wandb.Image(
+                            make_grid(comparison, nrow=8)
+                        ),
+                        "samples/random": _wandb.Image(make_grid(gen_vis, nrow=8)),
+                        "samples/interpolation": _wandb.Image(
+                            make_grid(interp_grid, nrow=8)
+                        ),
+                    },
+                    step=self.global_step,
+                )
+
+        print(f"  → Saved samples to {sample_dir}/")
+        self.vae.train()
+
+    # ── FID / LPIPS ───────────────────────────────────────
+    @torch.no_grad()
+    def _compute_fid_lpips(self, epoch):
+        """Compute FID and LPIPS diversity on generated samples."""
+        try:
+            from torchmetrics.image.fid import FrechetInceptionDistance
+            from torchmetrics.image.lpip import (
+                LearnedPerceptualImagePatchSimilarity,
+            )
+        except ImportError:
+            print(
+                "  ⚠ torchmetrics not installed — skipping FID/LPIPS. "
+                "Install with: pip install torchmetrics[image]"
+            )
+            return
+
+        self.vae.eval()
+        device = self.device
+        hp = self.hparams
+        n = hp.fid_n_samples
+
+        fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+        lpips_metric = LearnedPerceptualImagePatchSimilarity(
+            net_type="squeeze", normalize=True
+        ).to(device)
+
+        # Collect real images
+        real_count = 0
+        for data_batch in self.trainer.train_dataloader:
+            imgs = data_batch["pixel_values"].to(device) * 0.5 + 0.5
+            fid.update(imgs, real=True)
+            real_count += imgs.shape[0]
+            if real_count >= n:
+                break
+
+        # Generate fake images
+        gen_count = 0
+        lpips_vals = []
+        while gen_count < n:
+            cur_batch = min(hp.batch_size, n - gen_count)
+            z = torch.randn(cur_batch, hp.latent_dim, device=device)
+            fake = self.vae.decode(z) * 0.5 + 0.5
+            fid.update(fake, real=False)
+            if fake.shape[0] >= 2:
+                half = fake.shape[0] // 2
+                lpips_vals.append(
+                    lpips_metric(fake[0::2][:half], fake[1::2][:half]).item()
+                )
+            gen_count += cur_batch
+
+        fid_score = fid.compute().item()
+        avg_lpips = np.mean(lpips_vals) if lpips_vals else 0.0
+
+        self.log("metrics/FID", fid_score)
+        self.log("metrics/LPIPS_diversity", avg_lpips)
+        print(f"  → FID: {fid_score:.2f} | LPIPS diversity: {avg_lpips:.4f}")
+
+        del fid, lpips_metric
+        self.vae.train()
+
+    # ── Optimizer / Scheduler ─────────────────────────────
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.vae.parameters(), lr=self.hparams.lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.hparams.epochs, eta_min=1e-6
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+        }
+
+
+# ==========================================
+# 8. CLI Arguments
 # ==========================================
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train a ResNet-style VAE on AFHQ animal faces"
+        description="Train a ResNet-style VAE on AFHQ (multi-GPU via Lightning DDP)"
     )
 
     # Core hyperparameters
@@ -321,10 +658,8 @@ def parse_args():
     # KL weight schedule
     parser.add_argument("--kl-weight-max", type=float, default=0.0001)
     parser.add_argument(
-        "--kl-weight-min",
-        type=float,
-        default=None,
-        help="Set when resuming to ramp from old KL weight to --kl-weight-max",
+        "--kl-weight-min", type=float, default=None,
+        help="Starting KL weight (ramps to --kl-weight-max over warmup)",
     )
     parser.add_argument("--kl-warmup-epochs", type=int, default=30)
 
@@ -335,12 +670,14 @@ def parse_args():
     )
     parser.add_argument(
         "--perc-warmup-epochs", type=int, default=50,
-        help="Epochs to linearly ramp perceptual weight from 0 to --perc-weight",
+        help="Epochs to ramp perceptual weight from 0 to --perc-weight",
     )
     parser.add_argument(
         "--ssim-weight", type=float, default=0.1,
         help="SSIM loss coefficient (0 to disable)",
     )
+
+    # Checkpointing
     parser.add_argument(
         "--save-every", type=int, default=10,
         help="Save checkpoint every N epochs (always saves best)",
@@ -348,23 +685,40 @@ def parse_args():
 
     # Output
     parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=None,
+        "--output-dir", type=str, default=None,
         help="Output directory (default: runs/<timestamp>_z<latent_dim>)",
     )
 
-    # Resume
+    # Resume / weight loading
     parser.add_argument(
-        "--resume",
-        type=str,
-        default=None,
-        help="Path to checkpoint .pth to resume from",
+        "--resume", type=str, default=None,
+        help="Path to Lightning .ckpt to resume training (model + optimizer + epoch)",
     )
     parser.add_argument(
-        "--reset-lr",
-        action="store_true",
-        help="Reset LR schedule when resuming (use --lr value)",
+        "--load-weights", type=str, default=None,
+        help="Load VAE weights from a raw .pth state_dict (no optimizer/epoch resume)",
+    )
+    parser.add_argument(
+        "--reset-lr", action="store_true",
+        help="When using --resume, load weights only and reset optimizer/scheduler",
+    )
+
+    # Hardware / multi-GPU
+    parser.add_argument(
+        "--accelerator", type=str, default="auto",
+        help="Lightning accelerator: auto, gpu, cpu, tpu",
+    )
+    parser.add_argument(
+        "--devices", type=str, default="auto",
+        help="Devices: 'auto', count (e.g. '2'), or list (e.g. '0,1')",
+    )
+    parser.add_argument(
+        "--strategy", type=str, default="auto",
+        help="Strategy: auto, ddp, fsdp, deepspeed, etc.",
+    )
+    parser.add_argument(
+        "--precision", type=str, default="16-mixed",
+        help="Training precision: 16-mixed, bf16-mixed, 32-true",
     )
 
     # Data
@@ -373,7 +727,7 @@ def parse_args():
     # Metrics
     parser.add_argument(
         "--fid-every", type=int, default=0,
-        help="Compute FID/LPIPS every N epochs (0 to disable; requires torchmetrics)",
+        help="Compute FID/LPIPS every N epochs (0=disable; needs torchmetrics)",
     )
     parser.add_argument(
         "--fid-n-samples", type=int, default=1000,
@@ -383,7 +737,7 @@ def parse_args():
     # Weights & Biases
     parser.add_argument(
         "--wandb", action="store_true",
-        help="Enable Weights & Biases logging (requires `pip install wandb`)",
+        help="Enable W&B logging (pip install wandb)",
     )
     parser.add_argument("--wandb-project", type=str, default="vae-afhq")
     parser.add_argument("--wandb-entity", type=str, default=None)
@@ -393,107 +747,14 @@ def parse_args():
 
 
 # ==========================================
-# 5. Visualization Helpers
-# ==========================================
-@torch.no_grad()
-def save_samples(model, epoch, data_batch, latent_dim, device, sample_dir, writer=None):
-    """Save reconstruction + random generation + interpolation grids."""
-    model.eval()
-    recon, _, _ = model(data_batch[:8])
-    # Denormalize from [-1,1] to [0,1] for saving / TB
-    orig_vis = data_batch[:8] * 0.5 + 0.5
-    recon_vis = recon * 0.5 + 0.5
-    comparison = torch.cat([orig_vis, recon_vis], dim=0)
-    save_image(
-        comparison,
-        os.path.join(sample_dir, f"recon_epoch_{epoch+1:04d}.png"),
-        nrow=8,
-    )
-
-    z_random = torch.randn(8, latent_dim, device=device)
-    generated = model.decode(z_random)
-    gen_vis = generated * 0.5 + 0.5
-    save_image(
-        gen_vis,
-        os.path.join(sample_dir, f"gen_epoch_{epoch+1:04d}.png"),
-        nrow=8,
-    )
-
-    # Latent interpolation: slerp between two random z vectors, 8 steps
-    interp_grid = _latent_interpolation(model, latent_dim, device, n_steps=8)
-    save_image(
-        interp_grid,
-        os.path.join(sample_dir, f"interp_epoch_{epoch+1:04d}.png"),
-        nrow=8,
-    )
-
-    # Log image grids to TensorBoard
-    if writer is not None:
-        writer.add_image("samples/reconstruction", make_grid(comparison, nrow=8), epoch)
-        writer.add_image("samples/random", make_grid(gen_vis, nrow=8), epoch)
-        writer.add_image("samples/interpolation", make_grid(interp_grid, nrow=8), epoch)
-
-    # Log to W&B
-    if _wandb is not None and _wandb.run is not None:
-        _wandb.log({
-            "samples/reconstruction": _wandb.Image(make_grid(comparison, nrow=8)),
-            "samples/random": _wandb.Image(make_grid(gen_vis, nrow=8)),
-            "samples/interpolation": _wandb.Image(make_grid(interp_grid, nrow=8)),
-        }, step=epoch)
-
-    model.train()
-
-
-@torch.no_grad()
-def _latent_interpolation(model, latent_dim, device, n_pairs=2, n_steps=8):
-    """Spherical linear interpolation between random z pairs.
-    Returns a (n_pairs*n_steps) batch of decoded images in [0,1]."""
-    images = []
-    for _ in range(n_pairs):
-        z0 = torch.randn(latent_dim, device=device)
-        z1 = torch.randn(latent_dim, device=device)
-        # Normalise for slerp
-        z0_n = z0 / z0.norm()
-        z1_n = z1 / z1.norm()
-        omega = torch.acos(torch.clamp(torch.dot(z0_n, z1_n), -1.0, 1.0))
-        sin_omega = torch.sin(omega).clamp(min=1e-6)
-        for t in torch.linspace(0, 1, n_steps):
-            z_t = (torch.sin((1 - t) * omega) / sin_omega) * z0 + (
-                torch.sin(t * omega) / sin_omega
-            ) * z1
-            images.append(model.decode(z_t.unsqueeze(0)))
-    return torch.cat(images, dim=0) * 0.5 + 0.5  # [-1,1] → [0,1]
-
-
-def _compute_gradient_norm(model) -> float:
-    """Total L2 gradient norm across all parameters (for logging)."""
-    total_norm_sq = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            total_norm_sq += p.grad.data.norm(2).item() ** 2
-    return total_norm_sq ** 0.5
-
-
-# ==========================================
-# 6. Main
+# 9. Main
 # ==========================================
 def main():
     args = parse_args()
 
-    # Seed & determinism
+    # Seed everything (torch, numpy, random, CUDA)
     if args.seed is not None:
-        torch.manual_seed(args.seed)
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(args.seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    else:
-        torch.backends.cudnn.benchmark = True
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training on: {device}")
+        pl.seed_everything(args.seed, workers=True)
 
     # Output directory
     if args.output_dir:
@@ -502,354 +763,147 @@ def main():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_dir = os.path.join("runs", f"{timestamp}_z{args.latent_dim}")
     sample_dir = os.path.join(out_dir, "samples")
-    ckpt_dir = os.path.join(out_dir, "checkpoints")
     os.makedirs(sample_dir, exist_ok=True)
-    os.makedirs(ckpt_dir, exist_ok=True)
     print(f"Output directory: {out_dir}")
 
-    # ── TensorBoard ───────────────────────────────────────
-    writer = SummaryWriter(log_dir=os.path.join(out_dir, "tb"))
-    # Log hyperparameters as text for easy reference
-    writer.add_text("hparams", str(vars(args)), 0)
-
-    # ── Weights & Biases ──────────────────────────────────
-    use_wandb = args.wandb and _wandb is not None
-    if args.wandb and _wandb is None:
-        print("WARNING: --wandb requested but `wandb` not installed. Skipping.")
-    if use_wandb:
-        _wandb.init(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            name=args.wandb_run_name or os.path.basename(out_dir),
-            config=vars(args),
-            dir=out_dir,
-        )
-        _wandb.watch(model, log="gradients", log_freq=100)
-        print(f"W&B run: {_wandb.run.url}")
-
-    # ── Data ──────────────────────────────────────────────
-    print("Loading huggan/AFHQ dataset...")
-    dataset = load_dataset("huggan/AFHQ", split="train")
-    print(f"Dataset size: {len(dataset)} images")
-
-    img_size = args.img_size
-    aug_transform = transforms.Compose(
-        [
-            transforms.Resize((img_size, img_size)),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ]
-    )
-
-    def transform_fn(examples):
-        examples["pixel_values"] = [
-            aug_transform(image.convert("RGB")) for image in examples["image"]
-        ]
-        del examples["image"]
-        return examples
-
-    dataset.set_transform(transform_fn)
-
-    # Seeded DataLoader for reproducibility
-    loader_generator = None
-    worker_init = None
-    if args.seed is not None:
-        loader_generator = torch.Generator()
-        loader_generator.manual_seed(args.seed)
-
-        def worker_init(worker_id):
-            worker_seed = args.seed + worker_id
-            np.random.seed(worker_seed)
-            random.seed(worker_seed)
-
-    train_loader = DataLoader(
-        dataset,
+    # ── Data Module ───────────────────────────────────────
+    datamodule = AFHQDataModule(
+        img_size=args.img_size,
         batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=True,
         num_workers=args.num_workers,
-        pin_memory=True,
-        prefetch_factor=2,
-        generator=loader_generator,
-        worker_init_fn=worker_init,
+        seed=args.seed,
     )
 
-    # ── Model / Optimizer / Scheduler / AMP ───────────────
-    model = VAE(args.latent_dim).to(device)
-    perceptual_loss_fn = VGGPerceptualLoss().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-6
+    # ── Lightning Module ──────────────────────────────────
+    model = VAELightningModule(
+        latent_dim=args.latent_dim,
+        lr=args.lr,
+        epochs=args.epochs,
+        kl_weight_max=args.kl_weight_max,
+        kl_weight_min=args.kl_weight_min,
+        kl_warmup_epochs=args.kl_warmup_epochs,
+        perc_weight=args.perc_weight,
+        perc_warmup_epochs=args.perc_warmup_epochs,
+        ssim_weight=args.ssim_weight,
+        sample_dir=sample_dir,
+        fid_every=args.fid_every,
+        fid_n_samples=args.fid_n_samples,
+        batch_size=args.batch_size,
     )
-    use_amp = device.type == "cuda"
-    scaler = GradScaler(enabled=use_amp)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {total_params:,} (trainable: {trainable_params:,})")
+    # Load raw .pth weights (no optimizer/epoch resume)
+    if args.load_weights and os.path.isfile(args.load_weights):
+        ckpt = torch.load(args.load_weights, map_location="cpu", weights_only=False)
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            # Lightning checkpoint format → extract VAE weights
+            vae_state = {
+                k.replace("vae.", ""): v
+                for k, v in ckpt["state_dict"].items()
+                if k.startswith("vae.")
+            }
+            model.vae.load_state_dict(vae_state)
+        elif isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            # Old training checkpoint format
+            model.vae.load_state_dict(ckpt["model_state_dict"])
+        else:
+            # Raw state_dict
+            model.vae.load_state_dict(ckpt)
+        print(f"Loaded VAE weights from: {args.load_weights}")
 
-    # ── Resume ────────────────────────────────────────────
-    start_epoch = 0
-    best_loss = float("inf")
-    resumed_kl_weight = None  # Will hold last kl_weight from checkpoint
-    if args.resume and os.path.isfile(args.resume):
-        print(f"Loading checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        if "scaler_state_dict" in checkpoint and use_amp:
-            scaler.load_state_dict(checkpoint["scaler_state_dict"])
-        start_epoch = checkpoint["epoch"] + 1
-        best_loss = checkpoint.get("best_loss", float("inf"))
-        resumed_kl_weight = checkpoint.get("kl_weight", None)
-        if args.reset_lr:
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = args.lr
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=args.epochs - start_epoch, eta_min=1e-6
-            )
-            print(
-                f"Resuming from epoch {start_epoch}, best_loss: {best_loss:.6f}, "
-                f"LR reset to {args.lr}"
+    total_params = sum(p.numel() for p in model.vae.parameters())
+    trainable = sum(p.numel() for p in model.vae.parameters() if p.requires_grad)
+    print(f"VAE parameters: {total_params:,} (trainable: {trainable:,})")
+
+    # ── Loggers ───────────────────────────────────────────
+    loggers = [TensorBoardLogger(save_dir=out_dir, name="tb")]
+    if args.wandb:
+        if _WandbLogger is not None:
+            loggers.append(
+                _WandbLogger(
+                    project=args.wandb_project,
+                    entity=args.wandb_entity,
+                    name=args.wandb_run_name or os.path.basename(out_dir),
+                    save_dir=out_dir,
+                    config=vars(args),
+                )
             )
         else:
-            print(f"Resuming from epoch {start_epoch}, best_loss: {best_loss:.6f}")
-        if resumed_kl_weight is not None:
-            print(f"  Restored kl_weight: {resumed_kl_weight:.6f}")
+            print("WARNING: --wandb requested but wandb not installed.")
+
+    # ── Callbacks ─────────────────────────────────────────
+    callbacks = [
+        LearningRateMonitor(logging_interval="epoch"),
+        # Periodic checkpoints (keep last 3)
+        ModelCheckpoint(
+            dirpath=os.path.join(out_dir, "checkpoints"),
+            filename="epoch_{epoch:04d}",
+            every_n_epochs=args.save_every,
+            save_top_k=3,
+            monitor=None,  # No metric → keeps last 3 periodic saves
+            save_last=True,
+        ),
+        # Best model by total loss
+        ModelCheckpoint(
+            dirpath=out_dir,
+            filename=f"dog_vae_{args.latent_dim}_best",
+            monitor="loss/total",
+            mode="min",
+            save_top_k=1,
+        ),
+    ]
+
+    # ── Trainer ───────────────────────────────────────────
+    # Parse devices: "auto", int string like "2", or comma-separated "0,1"
+    devices = args.devices
+    if devices != "auto":
+        devices = (
+            [int(d) for d in devices.split(",")]
+            if "," in devices
+            else int(devices)
+        )
+
+    trainer = pl.Trainer(
+        max_epochs=args.epochs,
+        accelerator=args.accelerator,
+        devices=devices,
+        strategy=args.strategy,
+        precision=args.precision,
+        gradient_clip_val=1.0,
+        logger=loggers,
+        callbacks=callbacks,
+        deterministic="warn" if args.seed is not None else False,
+        enable_progress_bar=True,
+        log_every_n_steps=1,
+    )
+
+    # ── Resume handling ───────────────────────────────────
+    ckpt_path = None
+    if args.resume and os.path.isfile(args.resume):
+        if args.reset_lr:
+            # Load model weights only; optimizer & scheduler start fresh
+            ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
+            if "state_dict" in ckpt:
+                model.load_state_dict(ckpt["state_dict"])
+            print(f"Loaded weights from {args.resume}, LR reset to {args.lr}")
+        else:
+            # Full resume: model + optimizer + scheduler + epoch
+            ckpt_path = args.resume
+            print(f"Will resume from: {args.resume}")
     elif args.resume:
         print(f"WARNING: Checkpoint '{args.resume}' not found, training from scratch.")
 
-    # ── Training Loop ─────────────────────────────────────
-    model.train()
-    print(f"Starting training from epoch {start_epoch}...")
-    viz_batch = None
+    # ── Train ─────────────────────────────────────────────
+    trainer.fit(model, datamodule=datamodule, ckpt_path=ckpt_path)
 
-    for epoch in range(start_epoch, args.epochs):
-        train_loss = 0
-        train_l1 = 0
-        train_perc = 0
-        train_kld = 0
-        train_ssim = 0
-        train_grad_norm = 0
-        num_batches = 0
-
-        # KL weight schedule
-        kl_weight = min(1.0, epoch / args.kl_warmup_epochs) * args.kl_weight_max
-        # Gradual KL ramp when resuming with a higher kl-weight-max
-        if args.kl_weight_min is not None and start_epoch > 0:
-            ramp_progress = min(
-                1.0, (epoch - start_epoch) / args.kl_warmup_epochs
-            )
-            kl_weight = (
-                args.kl_weight_min
-                + (args.kl_weight_max - args.kl_weight_min) * ramp_progress
-            )
-        # If resuming and kl-weight-min not set, use checkpoint kl_weight as
-        # starting floor for the warmup schedule (avoids sudden jumps)
-        elif resumed_kl_weight is not None and epoch == start_epoch:
-            kl_weight = resumed_kl_weight
-
-        # Perceptual weight ramp: 0 → perc_weight over perc_warmup_epochs
-        perc_weight = (
-            min(1.0, epoch / max(1, args.perc_warmup_epochs)) * args.perc_weight
-        )
-
-        for batch in train_loader:
-            data = batch["pixel_values"].to(device)
-
-            if viz_batch is None:
-                viz_batch = data.clone()
-
-            optimizer.zero_grad()
-
-            with autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                reconstructed_batch, mu, logvar = model(data)
-                loss, l1_val, perc_val, kld_val, ssim_val = vae_loss(
-                    reconstructed_batch, data, mu, logvar, perceptual_loss_fn,
-                    kl_weight=kl_weight, perc_weight=perc_weight,
-                    ssim_weight=args.ssim_weight,
-                )
-
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-            # Track gradient norm (after unscale, before step)
-            grad_norm = _compute_gradient_norm(model)
-
-            train_loss += loss.item()
-            train_l1 += l1_val
-            train_perc += perc_val
-            train_kld += kld_val
-            train_ssim += ssim_val
-            train_grad_norm += grad_norm
-            num_batches += 1
-            scaler.step(optimizer)
-            scaler.update()
-
-        scheduler.step()
-
-        avg_loss = train_loss / num_batches
-        avg_l1 = train_l1 / num_batches
-        avg_perc = train_perc / num_batches
-        avg_kld = train_kld / num_batches
-        avg_ssim = train_ssim / num_batches
-        avg_grad_norm = train_grad_norm / num_batches
-        current_lr = scheduler.get_last_lr()[0]
-
-        # ── TensorBoard scalars ───────────────────────────
-        writer.add_scalar("loss/total", avg_loss, epoch)
-        writer.add_scalar("loss/L1", avg_l1, epoch)
-        writer.add_scalar("loss/perceptual", avg_perc, epoch)
-        writer.add_scalar("loss/SSIM", avg_ssim, epoch)
-        writer.add_scalar("loss/KLD", avg_kld, epoch)
-        writer.add_scalar("schedule/kl_weight", kl_weight, epoch)
-        writer.add_scalar("schedule/perc_weight", perc_weight, epoch)
-        writer.add_scalar("schedule/lr", current_lr, epoch)
-        writer.add_scalar("grad/norm", avg_grad_norm, epoch)
-
-        # ── W&B scalars ───────────────────────────────────
-        if use_wandb:
-            _wandb.log({
-                "loss/total": avg_loss,
-                "loss/L1": avg_l1,
-                "loss/perceptual": avg_perc,
-                "loss/SSIM": avg_ssim,
-                "loss/KLD": avg_kld,
-                "schedule/kl_weight": kl_weight,
-                "schedule/perc_weight": perc_weight,
-                "schedule/lr": current_lr,
-                "grad/norm": avg_grad_norm,
-                "epoch": epoch,
-            }, step=epoch)
-
-        if (epoch + 1) % 5 == 0:
-            print(
-                f"Epoch [{epoch+1}/{args.epochs}] - Loss: {avg_loss:.6f} | "
-                f"L1: {avg_l1:.6f} | Perc: {avg_perc:.4f} | SSIM: {avg_ssim:.4f} | "
-                f"KLD: {avg_kld:.4f} | KL_w: {kl_weight:.5f} | "
-                f"P_w: {perc_weight:.3f} | GradN: {avg_grad_norm:.4f} | "
-                f"LR: {current_lr:.2e}"
-            )
-
-        # Save visualization every 25 epochs
-        if (epoch + 1) % 25 == 0 and viz_batch is not None:
-            save_samples(
-                model, epoch, viz_batch, args.latent_dim, device, sample_dir,
-                writer=writer,
-            )
-            print(f"  → Saved samples to {sample_dir}/")
-
-        # Optional FID / LPIPS evaluation
-        if args.fid_every > 0 and (epoch + 1) % args.fid_every == 0:
-            _log_fid_lpips(model, train_loader, args, device, epoch, writer)
-
-        # Save checkpoint every N epochs (keep last 3)
-        if (epoch + 1) % args.save_every == 0 or epoch == args.epochs - 1:
-            checkpoint_data = {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "kl_weight": kl_weight,
-                "best_loss": best_loss,
-            }
-            ckpt_path = os.path.join(
-                ckpt_dir, f"checkpoint_epoch{epoch+1:04d}.pth"
-            )
-            torch.save(checkpoint_data, ckpt_path)
-            ckpts = sorted(glob.glob(os.path.join(ckpt_dir, "checkpoint_epoch*.pth")))
-            for old_ckpt in ckpts[:-3]:
-                os.remove(old_ckpt)
-
-        # Save best model
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            torch.save(
-                model.state_dict(),
-                os.path.join(out_dir, f"dog_vae_{args.latent_dim}_best.pth"),
-            )
-
-    # ── Save Final Weights ────────────────────────────────
-    torch.save(
-        model.state_dict(),
-        os.path.join(out_dir, f"dog_vae_{args.latent_dim}.pth"),
-    )
-    writer.close()
-    if use_wandb:
-        _wandb.finish()
-    print(f"\n✅ Training complete! Best loss: {best_loss:.6f}")
-    print(f"Models saved in: {out_dir}")
-    print(f"Sample images in: {sample_dir}")
-    print(f"TensorBoard logs: {os.path.join(out_dir, 'tb')}")
-    print(f"  → tensorboard --logdir {out_dir}/tb")
-
-
-# ==========================================
-# 7. FID / LPIPS (optional, requires torchmetrics)
-# ==========================================
-@torch.no_grad()
-def _log_fid_lpips(model, train_loader, args, device, epoch, writer):
-    """Generate samples and compute FID + LPIPS against real data.
-    Requires: pip install torchmetrics[image]  (includes torchmetrics + lpips)."""
-    try:
-        from torchmetrics.image.fid import FrechetInceptionDistance
-        from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-    except ImportError:
-        print("  ⚠ torchmetrics not installed — skipping FID/LPIPS. "
-              "Install with: pip install torchmetrics[image]")
-        return
-
-    model.eval()
-    n = args.fid_n_samples
-    batch = args.batch_size
-
-    fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
-    lpips = LearnedPerceptualImagePatchSimilarity(net_type="squeeze", normalize=True).to(device)
-
-    # Collect real images
-    real_count = 0
-    for data_batch in train_loader:
-        imgs = data_batch["pixel_values"].to(device)
-        imgs_01 = imgs * 0.5 + 0.5  # [-1,1] → [0,1]
-        fid.update(imgs_01, real=True)
-        real_count += imgs.shape[0]
-        if real_count >= n:
-            break
-
-    # Generate fake images
-    gen_count = 0
-    lpips_vals = []
-    while gen_count < n:
-        cur_batch = min(batch, n - gen_count)
-        z = torch.randn(cur_batch, args.latent_dim, device=device)
-        fake = model.decode(z) * 0.5 + 0.5
-        fid.update(fake, real=False)
-        # LPIPS: compare consecutive pairs
-        if fake.shape[0] >= 2:
-            lpips_vals.append(
-                lpips(fake[0::2][:fake.shape[0]//2], fake[1::2][:fake.shape[0]//2]).item()
-            )
-        gen_count += cur_batch
-
-    fid_score = fid.compute().item()
-    avg_lpips = np.mean(lpips_vals) if lpips_vals else 0.0
-
-    writer.add_scalar("metrics/FID", fid_score, epoch)
-    writer.add_scalar("metrics/LPIPS_diversity", avg_lpips, epoch)
-    if _wandb is not None and _wandb.run is not None:
-        _wandb.log({
-            "metrics/FID": fid_score,
-            "metrics/LPIPS_diversity": avg_lpips,
-        }, step=epoch)
-    print(f"  → FID: {fid_score:.2f} | LPIPS diversity: {avg_lpips:.4f}")
-
-    del fid, lpips
-    model.train()
+    # Save final raw state_dict for easy loading in dog_app.py
+    if trainer.is_global_zero:
+        final_path = os.path.join(out_dir, f"dog_vae_{args.latent_dim}.pth")
+        torch.save(model.vae.state_dict(), final_path)
+        print(f"\n✅ Training complete!")
+        print(f"Final weights: {final_path}")
+        print(f"Best model: {out_dir}/dog_vae_{args.latent_dim}_best.ckpt")
+        print(f"Sample images: {sample_dir}")
+        print(f"TensorBoard: tensorboard --logdir {out_dir}/tb")
 
 
 if __name__ == "__main__":
