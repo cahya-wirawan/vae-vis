@@ -6,72 +6,14 @@ from torchvision import transforms, models
 from torchvision.utils import save_image
 from torch.utils.data import DataLoader
 import os
+import argparse
+import time
+from datetime import datetime
+import random
+import numpy as np
 
 # ==========================================
-# 1. Hyperparameters & Setup
-# ==========================================
-BATCH_SIZE = 196
-EPOCHS = 500
-LEARNING_RATE = 2e-4
-LATENT_DIM = 256
-IMG_SIZE = 128
-KL_WEIGHT_MAX = 0.0001  # Very low: prioritize reconstruction quality first
-KL_WEIGHT_MIN = None  # Set when resuming to ramp from old KL weight (e.g. 0.0001) to KL_WEIGHT_MAX
-KL_WARMUP_EPOCHS = 30
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SAMPLE_DIR = "samples"
-RESUME_FROM = None  # Set to checkpoint path to resume, e.g. f"dog_vae_{LATENT_DIM}_checkpoint.pth"
-RESET_LR = False  # When True, restart LR schedule from LEARNING_RATE (ignore checkpoint's LR)
-
-os.makedirs(SAMPLE_DIR, exist_ok=True)
-print(f"Training on: {DEVICE}")
-
-# Load the AFHQ dataset from Hugging Face
-print("Loading huggan/AFHQ dataset...")
-dataset = load_dataset("huggan/AFHQ", split="train")
-print(f"Dataset size: {len(dataset)} images")
-
-# Data augmentation (lighter — dataset is much larger now)
-transform = transforms.Compose(
-    [
-        transforms.Resize((IMG_SIZE, IMG_SIZE)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
-        transforms.ToTensor(),
-    ]
-)
-
-# Clean transform for visualization
-transform_clean = transforms.Compose(
-    [
-        transforms.Resize((IMG_SIZE, IMG_SIZE)),
-        transforms.ToTensor(),
-    ]
-)
-
-
-def transform_fn(examples):
-    examples["pixel_values"] = [
-        transform(image.convert("RGB")) for image in examples["image"]
-    ]
-    del examples["image"]
-    return examples
-
-
-dataset.set_transform(transform_fn)
-train_loader = DataLoader(
-    dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    drop_last=True,
-    num_workers=4,
-    pin_memory=True,
-    prefetch_factor=2,
-)
-
-
-# ==========================================
-# 2. Perceptual Loss (VGG Feature Matching)
+# 1. Perceptual Loss (VGG Feature Matching)
 # ==========================================
 class VGGPerceptualLoss(nn.Module):
     """Compares VGG19 features between prediction and target.
@@ -110,7 +52,7 @@ class VGGPerceptualLoss(nn.Module):
 
 
 # ==========================================
-# 3. VAE Architecture (ResNet-style, no skip connections)
+# 2. VAE Architecture (ResNet-style, no skip connections)
 # ==========================================
 class ResBlock(nn.Module):
     """Residual block: adds input back to output for better gradient flow."""
@@ -267,7 +209,7 @@ class VAE(nn.Module):
 
 
 # ==========================================
-# 4. Loss Function
+# 3. Loss Function
 # ==========================================
 def vae_loss(reconstructed_x, x, mu, logvar, perceptual_fn, kl_weight=1.0):
     # L1 loss: sharper than MSE
@@ -284,141 +226,215 @@ def vae_loss(reconstructed_x, x, mu, logvar, perceptual_fn, kl_weight=1.0):
     return total, L1.item(), P_LOSS.item(), KLD.item()
 
 
-model = VAE(LATENT_DIM).to(DEVICE)
-perceptual_loss_fn = VGGPerceptualLoss().to(DEVICE)
-optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
-
-total_params = sum(p.numel() for p in model.parameters())
-trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"Model parameters: {total_params:,} (trainable: {trainable_params:,})")
-
-# Resume from checkpoint if specified
-start_epoch = 0
-best_loss = float("inf")
-if RESUME_FROM and os.path.isfile(RESUME_FROM):
-    print(f"Loading checkpoint: {RESUME_FROM}")
-    checkpoint = torch.load(RESUME_FROM, map_location=DEVICE, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-    start_epoch = checkpoint["epoch"] + 1
-    best_loss = checkpoint.get("best_loss", float("inf"))
-    if RESET_LR:
-        # Override with fresh LR schedule while keeping optimizer momentum
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = LEARNING_RATE
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=EPOCHS - start_epoch, eta_min=1e-6
-        )
-        print(f"Resuming from epoch {start_epoch}, best_loss: {best_loss:.6f}, LR reset to {LEARNING_RATE}")
-    else:
-        print(f"Resuming from epoch {start_epoch}, best_loss: {best_loss:.6f}")
-else:
-    if RESUME_FROM:
-        print(f"WARNING: Checkpoint '{RESUME_FROM}' not found, training from scratch.")
-
-
 # ==========================================
-# 5. Visualization Helper
+# 4. Visualization Helper
 # ==========================================
 @torch.no_grad()
-def save_samples(model, epoch, data_batch):
+def save_samples(model, epoch, data_batch, sample_dir, latent_dim, device):
     """Save reconstruction + random generation samples every N epochs."""
     model.eval()
     # Reconstruct training images
     recon, _, _ = model(data_batch[:8])
     comparison = torch.cat([data_batch[:8], recon], dim=0)
-    save_image(comparison, f"{SAMPLE_DIR}/recon_epoch_{epoch+1:03d}.png", nrow=8)
+    save_image(comparison, f"{sample_dir}/recon_epoch_{epoch+1:03d}.png", nrow=8)
 
     # Generate from random latent vectors
-    z_random = torch.randn(8, LATENT_DIM, device=DEVICE)
+    z_random = torch.randn(8, latent_dim, device=device)
     generated = model.decode(z_random)
-    save_image(generated, f"{SAMPLE_DIR}/gen_epoch_{epoch+1:03d}.png", nrow=8)
+    save_image(generated, f"{sample_dir}/gen_epoch_{epoch+1:03d}.png", nrow=8)
     model.train()
 
 
 # ==========================================
-# 6. Training Loop
+# 5. Main Training Function
 # ==========================================
-model.train()
-print(f"Starting training from epoch {start_epoch}...")
-viz_batch = None  # Will store a fixed batch for consistent visualization
+def main():
+    parser = argparse.ArgumentParser(description="Train a VAE on AFHQ Dog dataset")
+    parser.add_argument("--batch_size", type=int, default=196, help="Batch size for training")
+    parser.add_argument("--epochs", type=int, default=500, help="Number of epochs to train")
+    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
+    parser.add_argument("--latent_dim", type=int, default=256, help="Dimension of latent space")
+    parser.add_argument("--img_size", type=int, default=128, help="Image size (square)")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of worker processes for data loading")
+    parser.add_argument("--kl_weight_max", type=float, default=0.0001, help="Max KL divergence weight")
+    parser.add_argument("--kl_warmup_epochs", type=int, default=30, help="Epochs for KL weight warmup")
+    parser.add_argument("--output_dir", type=str, default=None, help="Output directory path (default: output/run_timestamp)")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--reset_lr", action="store_true", help="Reset learning rate when resuming")
+    
+    args = parser.parse_args()
 
-for epoch in range(start_epoch, EPOCHS):
-    train_loss = 0
-    train_l1 = 0
-    train_perc = 0
-    train_kld = 0
-    num_batches = 0
+    # Set seed
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
-    kl_weight = min(1.0, epoch / KL_WARMUP_EPOCHS) * KL_WEIGHT_MAX
-    # Gradual KL ramp when resuming with a higher KL_WEIGHT_MAX
-    if KL_WEIGHT_MIN is not None and start_epoch > 0:
-        ramp_progress = min(1.0, (epoch - start_epoch) / KL_WARMUP_EPOCHS)
-        kl_weight = KL_WEIGHT_MIN + (KL_WEIGHT_MAX - KL_WEIGHT_MIN) * ramp_progress
+    # Setup Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Training on: {device}")
 
-    for batch in train_loader:
-        data = batch["pixel_values"].to(DEVICE)
+    # Setup Output Directory
+    if args.output_dir is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_root = f"output/run_{timestamp}"
+    else:
+        output_root = args.output_dir
+    
+    sample_dir = os.path.join(output_root, "samples")
+    checkpoint_dir = os.path.join(output_root, "checkpoints")
+    os.makedirs(sample_dir, exist_ok=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"Output directory: {output_root}")
 
-        # Store first batch for visualization
-        if viz_batch is None:
-            viz_batch = data.clone()
+    # Load the AFHQ dataset from Hugging Face
+    print("Loading huggan/AFHQ dataset...")
+    dataset = load_dataset("huggan/AFHQ", split="train")
+    print(f"Dataset size: {len(dataset)} images")
 
-        optimizer.zero_grad()
-        reconstructed_batch, mu, logvar = model(data)
+    # Data augmentation
+    transform = transforms.Compose(
+        [
+            transforms.Resize((args.img_size, args.img_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+            transforms.ToTensor(),
+        ]
+    )
 
-        loss, l1_val, perc_val, kld_val = vae_loss(
-            reconstructed_batch, data, mu, logvar, perceptual_loss_fn, kl_weight
-        )
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    def transform_fn(examples):
+        examples["pixel_values"] = [
+            transform(image.convert("RGB")) for image in examples["image"]
+        ]
+        del examples["image"]
+        return examples
 
-        train_loss += loss.item()
-        train_l1 += l1_val
-        train_perc += perc_val
-        train_kld += kld_val
-        num_batches += 1
-        optimizer.step()
+    dataset.set_transform(transform_fn)
+    train_loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        prefetch_factor=2,
+    )
 
-    scheduler.step()
+    # Initialize Model, Loss, Optimizer
+    model = VAE(args.latent_dim).to(device)
+    perceptual_loss_fn = VGGPerceptualLoss().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
-    avg_loss = train_loss / num_batches
-    avg_l1 = train_l1 / num_batches
-    avg_perc = train_perc / num_batches
-    avg_kld = train_kld / num_batches
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: {total_params:,} (trainable: {trainable_params:,})")
 
-    if (epoch + 1) % 5 == 0:
-        print(
-            f"Epoch [{epoch+1}/{EPOCHS}] - Loss: {avg_loss:.6f} | "
-            f"L1: {avg_l1:.6f} | Perc: {avg_perc:.4f} | KLD: {avg_kld:.4f} | "
-            f"KL_w: {kl_weight:.5f} | LR: {scheduler.get_last_lr()[0]:.2e}"
-        )
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    best_loss = float("inf")
+    if args.resume and os.path.isfile(args.resume):
+        print(f"Loading checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        start_epoch = checkpoint["epoch"] + 1
+        best_loss = checkpoint.get("best_loss", float("inf"))
+        if args.reset_lr:
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = args.lr
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=args.epochs - start_epoch, eta_min=1e-6
+            )
+            print(f"Resuming from epoch {start_epoch}, best_loss: {best_loss:.6f}, LR reset to {args.lr}")
+        else:
+            print(f"Resuming from epoch {start_epoch}, best_loss: {best_loss:.6f}")
+    elif args.resume:
+        print(f"WARNING: Checkpoint '{args.resume}' not found, training from scratch.")
 
-    # Save visualization every 25 epochs
-    if (epoch + 1) % 25 == 0 and viz_batch is not None:
-        save_samples(model, epoch, viz_batch)
-        print(f"  → Saved samples to {SAMPLE_DIR}/")
+    # Training Loop
+    model.train()
+    print(f"Starting training from epoch {start_epoch}...")
+    viz_batch = None  # Will store a fixed batch for consistent visualization
 
-    # Save checkpoint (full state for resuming)
-    checkpoint_data = {
-        "epoch": epoch,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "best_loss": best_loss,
-    }
-    torch.save(checkpoint_data, f"dog_vae_{LATENT_DIM}_checkpoint.pth")
+    for epoch in range(start_epoch, args.epochs):
+        train_loss = 0
+        train_l1 = 0
+        train_perc = 0
+        train_kld = 0
+        num_batches = 0
 
-    # Save best model
-    if avg_loss < best_loss:
-        best_loss = avg_loss
-        torch.save(model.state_dict(), f"dog_vae_{LATENT_DIM}_best.pth")
+        kl_weight = min(1.0, epoch / args.kl_warmup_epochs) * args.kl_weight_max
 
-# ==========================================
-# 7. Save Final Weights
-# ==========================================
-torch.save(model.state_dict(), f"dog_vae_{LATENT_DIM}.pth")
-print(f"\n✅ Training complete! Best loss: {best_loss:.6f}")
-print(f"Model saved: dog_vae_{LATENT_DIM}.pth / dog_vae_{LATENT_DIM}_best.pth")
-print(f"Sample images in: {SAMPLE_DIR}/")
+        for batch in train_loader:
+            data = batch["pixel_values"].to(device)
+
+            # Store first batch for visualization
+            if viz_batch is None:
+                viz_batch = data[:8].clone()
+
+            optimizer.zero_grad()
+            reconstructed_batch, mu, logvar = model(data)
+
+            loss, l1_val, perc_val, kld_val = vae_loss(
+                reconstructed_batch, data, mu, logvar, perceptual_loss_fn, kl_weight
+            )
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            train_loss += loss.item()
+            train_l1 += l1_val
+            train_perc += perc_val
+            train_kld += kld_val
+            num_batches += 1
+            optimizer.step()
+
+        scheduler.step()
+
+        avg_loss = train_loss / num_batches
+        avg_l1 = train_l1 / num_batches
+        avg_perc = train_perc / num_batches
+        avg_kld = train_kld / num_batches
+
+        if (epoch + 1) % 5 == 0:
+            print(
+                f"Epoch [{epoch+1}/{args.epochs}] - Loss: {avg_loss:.6f} | "
+                f"L1: {avg_l1:.6f} | Perc: {avg_perc:.4f} | KLD: {avg_kld:.4f} | "
+                f"KL_w: {kl_weight:.5f} | LR: {scheduler.get_last_lr()[0]:.2e}"
+            )
+
+        # Save visualization every 25 epochs
+        if (epoch + 1) % 25 == 0 and viz_batch is not None:
+            save_samples(model, epoch, viz_batch, sample_dir, args.latent_dim, device)
+            print(f"  → Saved samples to {sample_dir}/")
+
+        # Save latest checkpoint
+        checkpoint_data = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "best_loss": best_loss,
+            "args": args,
+        }
+        torch.save(checkpoint_data, os.path.join(output_root, "latest_checkpoint.pth"))
+
+        # Periodic checkpoint
+        if (epoch + 1) % 50 == 0:
+            torch.save(checkpoint_data, os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1:03d}.pth"))
+
+        # Save best model
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save(model.state_dict(), os.path.join(output_root, "best_model.pth"))
+
+    # Save Final Weights
+    torch.save(model.state_dict(), os.path.join(output_root, "final_model.pth"))
+    print(f"\n✅ Training complete! Best loss: {best_loss:.6f}")
+    print(f"Models saved in: {output_root}")
+
+if __name__ == "__main__":
+    main()
