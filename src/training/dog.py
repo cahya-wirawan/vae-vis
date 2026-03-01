@@ -3,14 +3,16 @@ import torch.nn as nn
 import torch.optim as optim
 from datasets import load_dataset
 from torchvision import transforms, models
-from torchvision.utils import save_image
+from torchvision.utils import save_image, make_grid
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 import os
 import argparse
 import time
 from datetime import datetime
 import random
 import numpy as np
+import wandb
 
 # ==========================================
 # 1. Perceptual Loss (VGG Feature Matching)
@@ -230,18 +232,35 @@ def vae_loss(reconstructed_x, x, mu, logvar, perceptual_fn, kl_weight=1.0):
 # 4. Visualization Helper
 # ==========================================
 @torch.no_grad()
-def save_samples(model, epoch, data_batch, sample_dir, latent_dim, device):
+def save_samples(model, epoch, data_batch, sample_dir, latent_dim, device, writer=None, use_wandb=False):
     """Save reconstruction + random generation samples every N epochs."""
     model.eval()
     # Reconstruct training images
     recon, _, _ = model(data_batch[:8])
     comparison = torch.cat([data_batch[:8], recon], dim=0)
-    save_image(comparison, f"{sample_dir}/recon_epoch_{epoch+1:03d}.png", nrow=8)
+    save_path = f"{sample_dir}/recon_epoch_{epoch+1:03d}.png"
+    save_image(comparison, save_path, nrow=8)
+    
+    if writer:
+        grid = make_grid(comparison, nrow=8)
+        writer.add_image("Reconstruction", grid, epoch + 1)
+    
+    if use_wandb:
+        wandb.log({"Reconstruction": wandb.Image(save_path)}, step=epoch + 1)
 
     # Generate from random latent vectors
     z_random = torch.randn(8, latent_dim, device=device)
     generated = model.decode(z_random)
-    save_image(generated, f"{sample_dir}/gen_epoch_{epoch+1:03d}.png", nrow=8)
+    gen_path = f"{sample_dir}/gen_epoch_{epoch+1:03d}.png"
+    save_image(generated, gen_path, nrow=8)
+    
+    if writer:
+        grid_gen = make_grid(generated, nrow=8)
+        writer.add_image("Generation", grid_gen, epoch + 1)
+        
+    if use_wandb:
+        wandb.log({"Generation": wandb.Image(gen_path)}, step=epoch + 1)
+        
     model.train()
 
 
@@ -262,6 +281,9 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--reset_lr", action="store_true", help="Reset learning rate when resuming")
+    parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases for logging")
+    parser.add_argument("--wandb_project", type=str, default="vae-vis-dog", help="WandB project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="WandB run name")
     
     args = parser.parse_args()
 
@@ -277,17 +299,28 @@ def main():
     print(f"Training on: {device}")
 
     # Setup Output Directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if args.output_dir is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_root = f"output/run_{timestamp}"
     else:
         output_root = args.output_dir
     
     sample_dir = os.path.join(output_root, "samples")
     checkpoint_dir = os.path.join(output_root, "checkpoints")
+    log_dir = os.path.join(output_root, "logs")
     os.makedirs(sample_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
     print(f"Output directory: {output_root}")
+
+    # Setup Logging
+    writer = SummaryWriter(log_dir=log_dir)
+    if args.use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name or f"run_{timestamp}",
+            config=vars(args)
+        )
 
     # Load the AFHQ dataset from Hugging Face
     print("Loading huggan/AFHQ dataset...")
@@ -398,17 +431,38 @@ def main():
         avg_l1 = train_l1 / num_batches
         avg_perc = train_perc / num_batches
         avg_kld = train_kld / num_batches
+        current_lr = scheduler.get_last_lr()[0]
+
+        # Log to TensorBoard
+        writer.add_scalar("Loss/Total", avg_loss, epoch + 1)
+        writer.add_scalar("Loss/L1", avg_l1, epoch + 1)
+        writer.add_scalar("Loss/Perceptual", avg_perc, epoch + 1)
+        writer.add_scalar("Loss/KLD", avg_kld, epoch + 1)
+        writer.add_scalar("Meta/KL_Weight", kl_weight, epoch + 1)
+        writer.add_scalar("Meta/LR", current_lr, epoch + 1)
+
+        # Log to WandB
+        if args.use_wandb:
+            wandb.log({
+                "epoch": epoch + 1,
+                "loss/total": avg_loss,
+                "loss/l1": avg_l1,
+                "loss/perceptual": avg_perc,
+                "loss/kld": avg_kld,
+                "meta/kl_weight": kl_weight,
+                "meta/lr": current_lr,
+            }, step=epoch + 1)
 
         if (epoch + 1) % 5 == 0:
             print(
                 f"Epoch [{epoch+1}/{args.epochs}] - Loss: {avg_loss:.6f} | "
                 f"L1: {avg_l1:.6f} | Perc: {avg_perc:.4f} | KLD: {avg_kld:.4f} | "
-                f"KL_w: {kl_weight:.5f} | LR: {scheduler.get_last_lr()[0]:.2e}"
+                f"KL_w: {kl_weight:.5f} | LR: {current_lr:.2e}"
             )
 
         # Save visualization every 25 epochs
         if (epoch + 1) % 25 == 0 and viz_batch is not None:
-            save_samples(model, epoch, viz_batch, sample_dir, args.latent_dim, device)
+            save_samples(model, epoch, viz_batch, sample_dir, args.latent_dim, device, writer, args.use_wandb)
             print(f"  → Saved samples to {sample_dir}/")
 
         # Save latest checkpoint
@@ -433,6 +487,9 @@ def main():
 
     # Save Final Weights
     torch.save(model.state_dict(), os.path.join(output_root, "final_model.pth"))
+    writer.close()
+    if args.use_wandb:
+        wandb.finish()
     print(f"\n✅ Training complete! Best loss: {best_loss:.6f}")
     print(f"Models saved in: {output_root}")
 
