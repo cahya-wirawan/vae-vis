@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebGPU Test</title>
+</head>
+<body>
+    <h1>WebGPU VAE Test</h1>
+    <div id='status'>Initializing...</div>
+    <script type='module'>
+        import init, { GpuDecoder } from './pkg/dog_wasm.js';
+
+        async function run() {
+            try {
+                await init();
+                const decoder = await GpuDecoder.new();
+                document.getElementById('status').innerText = '✅ WebGPU Decoder Ready!';
+                console.log('Decoder:', decoder);
+            } catch (e) {
+                document.getElementById('status').innerText = '❌ Error: ' + e;
+                console.error(e);
+            }
+        }
+        run();
+    </script>
+</body>
+</html>
