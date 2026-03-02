@@ -185,7 +185,7 @@
                     <button id="btn-interp-b">New B</button>
                     <button id="btn-interp-both">New Both</button>
                 </div>
-                <p class="section-label">Lerp between two random samples</p>
+                <p class="section-label">Slerp between two random samples</p>
                 <div class="interpolation-row">
                     <span>A</span>
                     <input type="range" id="slider-lerp" min="0" max="1" step="0.01" value="0.5">
@@ -249,9 +249,23 @@
             return d;
         }
 
-        function lerp(a, b, t) {
+        function slerp(a, b, t) {
+            let dot = 0;
+            for (let i = 0; i < LATENT_DIM; i++) dot += a[i] * b[i];
+            const normA = Math.sqrt(a.reduce((s, v) => s + v * v, 0));
+            const normB = Math.sqrt(b.reduce((s, v) => s + v * v, 0));
+            dot = Math.max(-1, Math.min(1, dot / (normA * normB + 1e-8)));
+            const theta = Math.acos(dot);
+            if (theta < 1e-6) {
+                const z = new Float32Array(LATENT_DIM);
+                for (let i = 0; i < LATENT_DIM; i++) z[i] = a[i] * (1 - t) + b[i] * t;
+                return z;
+            }
+            const sinT = Math.sin(theta);
+            const wA = Math.sin((1 - t) * theta) / sinT;
+            const wB = Math.sin(t * theta) / sinT;
             const z = new Float32Array(LATENT_DIM);
-            for (let i = 0; i < LATENT_DIM; i++) z[i] = a[i] * (1 - t) + b[i] * t;
+            for (let i = 0; i < LATENT_DIM; i++) z[i] = wA * a[i] + wB * b[i];
             return z;
         }
 
@@ -303,7 +317,7 @@
                     }
                 } else {
                     const t = parseFloat(document.getElementById('slider-lerp').value);
-                    z = lerp(interpA, interpB, t);
+                    z = slerp(interpA, interpB, t);
                 }
 
                 const t0 = performance.now();
