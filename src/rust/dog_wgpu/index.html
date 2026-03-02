@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AFHQ VAE Decoder</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f0f1a;
+            color: #e0e0e0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            padding: 24px;
+        }
+        h1 {
+            font-size: 1.6rem;
+            font-weight: 600;
+            margin-bottom: 6px;
+            color: #fff;
+        }
+        .subtitle {
+            font-size: 0.85rem;
+            color: #888;
+            margin-bottom: 24px;
+        }
+        .main {
+            display: flex;
+            gap: 32px;
+            align-items: flex-start;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .canvas-wrap {
+            position: relative;
+            border: 2px solid #333;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #1a1a2e;
+        }
+        canvas {
+            display: block;
+            width: 384px;
+            height: 384px;
+            image-rendering: auto;
+        }
+        .controls {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            min-width: 280px;
+        }
+        .btn-row {
+            display: flex;
+            gap: 8px;
+        }
+        button {
+            padding: 8px 16px;
+            border: 1px solid #444;
+            border-radius: 6px;
+            background: #1e1e3a;
+            color: #e0e0e0;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        button:hover { background: #2a2a50; }
+        button:active { background: #353570; }
+        button:disabled { opacity: 0.4; cursor: default; }
+        .slider-group {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .slider-group label {
+            font-size: 0.8rem;
+            color: #aaa;
+            display: flex;
+            justify-content: space-between;
+        }
+        .slider-group label span { color: #7eb8ff; font-family: monospace; }
+        input[type="range"] {
+            width: 100%;
+            accent-color: #5588cc;
+        }
+        select {
+            padding: 4px 8px;
+            border: 1px solid #444;
+            border-radius: 4px;
+            background: #1e1e3a;
+            color: #e0e0e0;
+            font-size: 0.8rem;
+        }
+        .dim-select {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            font-size: 0.8rem;
+            color: #aaa;
+        }
+        #status {
+            margin-top: 16px;
+            font-size: 0.85rem;
+            color: #888;
+            min-height: 1.2em;
+        }
+        #status.error { color: #ff6b6b; }
+        #status.ok { color: #6bff8b; }
+        .section-label {
+            font-size: 0.75rem;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .interpolation-row {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+        .interpolation-row input[type="range"] { flex: 1; }
+        .interpolation-row span {
+            font-size: 0.75rem;
+            color: #7eb8ff;
+            font-family: monospace;
+            min-width: 3.5em;
+            text-align: right;
+        }
+        .mode-tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 4px;
+        }
+        .mode-tabs button {
+            font-size: 0.8rem;
+            padding: 5px 12px;
+        }
+        .mode-tabs button.active {
+            background: #353570;
+            border-color: #5588cc;
+        }
+        .mode-panel { display: none; }
+        .mode-panel.active { display: flex; flex-direction: column; gap: 12px; }
+    </style>
+</head>
+<body>
+    <h1>AFHQ VAE Decoder</h1>
+    <p class="subtitle" id="subtitle">128×128 ResNet-style VAE · latent dim = 256</p>
+
+    <div class="main">
+        <div class="canvas-wrap">
+            <canvas id="output" width="128" height="128"></canvas>
+        </div>
+
+        <div class="controls">
+            <!-- Mode tabs -->
+            <div class="mode-tabs">
+                <button id="tab-explore" class="active">Explore</button>
+                <button id="tab-interp">Interpolate</button>
+            </div>
+
+            <!-- Explore mode -->
+            <div id="panel-explore" class="mode-panel active">
+                <div class="btn-row">
+                    <button id="btn-random">Random Z</button>
+                    <button id="btn-new-dirs">New Directions</button>
+                </div>
+                <p class="section-label">Navigate latent space</p>
+                <div class="slider-group">
+                    <label>Direction X <span id="val-x">0.00</span></label>
+                    <input type="range" id="slider-x" min="-4" max="4" step="0.05" value="0">
+                </div>
+                <div class="slider-group">
+                    <label>Direction Y <span id="val-y">0.00</span></label>
+                    <input type="range" id="slider-y" min="-4" max="4" step="0.05" value="0">
+                </div>
+            </div>
+
+            <!-- Interpolation mode -->
+            <div id="panel-interp" class="mode-panel">
+                <div class="btn-row">
+                    <button id="btn-interp-a">New A</button>
+                    <button id="btn-interp-b">New B</button>
+                    <button id="btn-interp-both">New Both</button>
+                </div>
+                <p class="section-label">Lerp between two random samples</p>
+                <div class="interpolation-row">
+                    <span>A</span>
+                    <input type="range" id="slider-lerp" min="0" max="1" step="0.01" value="0.5">
+                    <span>B</span>
+                </div>
+                <div style="text-align:center; font-size:0.8rem; color:#7eb8ff; font-family:monospace;">
+                    t = <span id="val-lerp">0.50</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <p id="status">Loading…</p>
+
+    <script type="module">
+        import { GPUDecoder } from './gpu-decoder.js';
+
+        // ---- Globals ----
+        let decoder = null;   // { generate(Float32Array) → Promise<Uint8Array> }
+        let backend = '';
+        const LATENT_DIM = 256;
+        const IMG_SIZE = 128;
+
+        const canvas = document.getElementById('output');
+        const ctx = canvas.getContext('2d');
+        const statusEl = document.getElementById('status');
+        const subtitleEl = document.getElementById('subtitle');
+
+        // Explore state
+        let baseZ = new Float32Array(LATENT_DIM);
+        let dirX = new Float32Array(LATENT_DIM);
+        let dirY = new Float32Array(LATENT_DIM);
+
+        // Interpolation state
+        let interpA = new Float32Array(LATENT_DIM);
+        let interpB = new Float32Array(LATENT_DIM);
+
+        // ---- Helpers ----
+        function randn() {
+            let u = 0, v = 0;
+            while (u === 0) u = Math.random();
+            while (v === 0) v = Math.random();
+            return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+        }
+
+        function randomLatent() {
+            const z = new Float32Array(LATENT_DIM);
+            for (let i = 0; i < LATENT_DIM; i++) z[i] = randn();
+            return z;
+        }
+
+        function randomUnitDir() {
+            const d = new Float32Array(LATENT_DIM);
+            let norm = 0;
+            for (let i = 0; i < LATENT_DIM; i++) {
+                d[i] = randn();
+                norm += d[i] * d[i];
+            }
+            norm = Math.sqrt(norm);
+            for (let i = 0; i < LATENT_DIM; i++) d[i] /= norm;
+            return d;
+        }
+
+        function lerp(a, b, t) {
+            const z = new Float32Array(LATENT_DIM);
+            for (let i = 0; i < LATENT_DIM; i++) z[i] = a[i] * (1 - t) + b[i] * t;
+            return z;
+        }
+
+        function drawRGBA(rgba) {
+            const imageData = ctx.createImageData(IMG_SIZE, IMG_SIZE);
+            imageData.data.set(rgba);
+            ctx.putImageData(imageData, 0, 0);
+        }
+
+        // ---- Mode Management ----
+        let currentMode = 'explore';
+
+        document.getElementById('tab-explore').addEventListener('click', () => switchMode('explore'));
+        document.getElementById('tab-interp').addEventListener('click', () => switchMode('interp'));
+
+        function switchMode(mode) {
+            currentMode = mode;
+            document.querySelectorAll('.mode-tabs button').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.mode-panel').forEach(p => p.classList.remove('active'));
+            document.getElementById('tab-' + mode).classList.add('active');
+            document.getElementById('panel-' + mode).classList.add('active');
+            scheduleGeneration();
+        }
+
+        // ---- Generation (always async) ----
+        let generating = false;
+        let pendingGen = false;
+
+        function scheduleGeneration() {
+            if (generating) { pendingGen = true; return; }
+            runGeneration();
+        }
+
+        async function runGeneration() {
+            if (!decoder || generating) return;
+            generating = true;
+            pendingGen = false;
+            statusEl.textContent = 'Generating…';
+            statusEl.className = '';
+
+            try {
+                let z;
+                if (currentMode === 'explore') {
+                    const sx = parseFloat(document.getElementById('slider-x').value);
+                    const sy = parseFloat(document.getElementById('slider-y').value);
+                    z = new Float32Array(LATENT_DIM);
+                    for (let i = 0; i < LATENT_DIM; i++) {
+                        z[i] = baseZ[i] + sx * dirX[i] + sy * dirY[i];
+                    }
+                } else {
+                    const t = parseFloat(document.getElementById('slider-lerp').value);
+                    z = lerp(interpA, interpB, t);
+                }
+
+                const t0 = performance.now();
+                const rgba = await decoder.generate(z);
+                const elapsed = (performance.now() - t0).toFixed(0);
+                drawRGBA(rgba);
+                statusEl.textContent = `${backend} · ${elapsed} ms`;
+                statusEl.className = 'ok';
+            } catch (e) {
+                statusEl.textContent = `Error: ${e}`;
+                statusEl.className = 'error';
+                console.error(e);
+            }
+            generating = false;
+            if (pendingGen) scheduleGeneration();
+        }
+
+        // ---- Explore Controls ----
+        const sliderX = document.getElementById('slider-x');
+        const sliderY = document.getElementById('slider-y');
+
+        sliderX.addEventListener('input', () => {
+            document.getElementById('val-x').textContent = parseFloat(sliderX.value).toFixed(2);
+            scheduleGeneration();
+        });
+        sliderY.addEventListener('input', () => {
+            document.getElementById('val-y').textContent = parseFloat(sliderY.value).toFixed(2);
+            scheduleGeneration();
+        });
+        document.getElementById('btn-random').addEventListener('click', () => {
+            baseZ = randomLatent();
+            sliderX.value = 0; sliderY.value = 0;
+            document.getElementById('val-x').textContent = '0.00';
+            document.getElementById('val-y').textContent = '0.00';
+            scheduleGeneration();
+        });
+        document.getElementById('btn-new-dirs').addEventListener('click', () => {
+            dirX = randomUnitDir();
+            dirY = randomUnitDir();
+            scheduleGeneration();
+        });
+
+        // ---- Interpolation Controls ----
+        const sliderLerp = document.getElementById('slider-lerp');
+        sliderLerp.addEventListener('input', () => {
+            document.getElementById('val-lerp').textContent = parseFloat(sliderLerp.value).toFixed(2);
+            scheduleGeneration();
+        });
+        document.getElementById('btn-interp-a').addEventListener('click', () => {
+            interpA = randomLatent();
+            scheduleGeneration();
+        });
+        document.getElementById('btn-interp-b').addEventListener('click', () => {
+            interpB = randomLatent();
+            scheduleGeneration();
+        });
+        document.getElementById('btn-interp-both').addEventListener('click', () => {
+            interpA = randomLatent();
+            interpB = randomLatent();
+            scheduleGeneration();
+        });
+
+        // ---- Init ----
+        async function main() {
+            try {
+                // Fetch weights
+                statusEl.textContent = 'Loading weights…';
+                const resp = await fetch('weights.bin');
+                if (!resp.ok) throw new Error(`HTTP ${resp.status} — place weights.bin in this directory`);
+                const weightsAB = await resp.arrayBuffer();
+                const sizeMB = (weightsAB.byteLength / 1024 / 1024).toFixed(1);
+                statusEl.textContent = `Weights loaded (${sizeMB} MB). Initializing decoder…`;
+
+                // Try WebGPU first
+                let gpuOk = false;
+                if (navigator.gpu) {
+                    try {
+                        statusEl.textContent = `Initializing WebGPU decoder…`;
+                        const gpuDec = await GPUDecoder.create(weightsAB);
+                        decoder = gpuDec;
+                        backend = 'WebGPU';
+                        gpuOk = true;
+                        console.log('Using WebGPU compute shaders');
+                    } catch (e) {
+                        console.warn('WebGPU init failed, falling back to WASM:', e);
+                    }
+                }
+
+                // WASM fallback
+                if (!gpuOk) {
+                    statusEl.textContent = `Initializing WASM decoder…`;
+                    const { default: wasmInit, DogDecoder } = await import('./pkg/dog_wgpu.js');
+                    await wasmInit();
+                    const wasmDec = new DogDecoder(new Uint8Array(weightsAB));
+                    decoder = {
+                        generate: async (z) => wasmDec.generate(z),
+                    };
+                    backend = 'WASM (CPU)';
+                    console.log('Using WASM CPU fallback');
+                }
+
+                subtitleEl.textContent = `128×128 ResNet-style VAE · ${backend} · latent dim = 256`;
+
+                // Initial state
+                baseZ = randomLatent();
+                dirX = randomUnitDir();
+                dirY = randomUnitDir();
+                interpA = randomLatent();
+                interpB = randomLatent();
+
+                statusEl.textContent = `Ready (${backend})`;
+                statusEl.className = 'ok';
+                scheduleGeneration();
+            } catch (e) {
+                statusEl.textContent = `Failed: ${e.message}`;
+                statusEl.className = 'error';
+                console.error(e);
+            }
+        }
+
+        main();
+    </script>
+</body>
+</html>
