@@ -1,0 +1,15 @@
+{
+  "name": "dog_wgpu",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "dog_wgpu_bg.wasm",
+    "dog_wgpu.js",
+    "dog_wgpu.d.ts"
+  ],
+  "main": "dog_wgpu.js",
+  "types": "dog_wgpu.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
