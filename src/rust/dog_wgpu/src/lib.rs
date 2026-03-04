@@ -22,32 +22,140 @@ const IMG_SIZE: usize = 128;
 // ---------------------------------------------------------------------------
 // Weight Reader — reads sequential f32 tensors from a flat byte buffer
 // ---------------------------------------------------------------------------
+// Weight format constants (must match quantize_dog.py)
+// ---------------------------------------------------------------------------
+const MAGIC: u32 = 0x56414551; // 'VAEQ'
+const MODE_FP32: u32 = 0;
+const MODE_FP16: u32 = 1;
+const MODE_INT8: u32 = 2;
+
+// ---------------------------------------------------------------------------
+// Weight Reader — reads sequential tensors from a flat byte buffer
+// ---------------------------------------------------------------------------
 struct WeightReader<'a> {
     data: &'a [u8],
     offset: usize,
+    mode: u32,
 }
 
 impl<'a> WeightReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, offset: 0 }
+        // Try to read header
+        if data.len() >= 16 {
+            let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            if magic == MAGIC {
+                let mode = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+                console_log!("Weight format: VAEQ v1, mode={}", mode);
+                return Self { data, offset: 16, mode };
+            }
+        }
+        // Legacy: no header, assume fp32
+        console_log!("Weight format: legacy fp32 (no header)");
+        Self { data, offset: 0, mode: MODE_FP32 }
+    }
+
+    fn read_bytes(&mut self, n: usize) -> &'a [u8] {
+        assert!(
+            self.offset + n <= self.data.len(),
+            "Weight data truncated at offset {} (need {} bytes, {} remain)",
+            self.offset, n, self.data.len() - self.offset
+        );
+        let slice = &self.data[self.offset..self.offset + n];
+        self.offset += n;
+        slice
+    }
+
+    fn read_u32(&mut self) -> u32 {
+        let b = self.read_bytes(4);
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
     }
 
     fn read_f32_vec(&mut self, count: usize) -> Vec<f32> {
-        let byte_len = count * 4;
-        assert!(
-            self.offset + byte_len <= self.data.len(),
-            "Weight data truncated at offset {} (need {} bytes, {} remain)",
-            self.offset,
-            byte_len,
-            self.data.len() - self.offset
-        );
-        let result: Vec<f32> = self.data[self.offset..self.offset + byte_len]
-            .chunks_exact(4)
+        match self.mode {
+            MODE_FP32 => self.read_f32_raw(count),
+            MODE_FP16 => self.read_f16_to_f32(count),
+            MODE_INT8 => self.read_int8_dequant(),
+            _ => panic!("Unknown weight mode {}", self.mode),
+        }
+    }
+
+    fn read_f32_raw(&mut self, count: usize) -> Vec<f32> {
+        let bytes = self.read_bytes(count * 4);
+        bytes.chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        self.offset += byte_len;
+            .collect()
+    }
+
+    fn read_f16_to_f32(&mut self, count: usize) -> Vec<f32> {
+        let bytes = self.read_bytes(count * 2);
+        bytes.chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect()
+    }
+
+    fn read_int8_dequant(&mut self) -> Vec<f32> {
+        let num_elements = self.read_u32() as usize;
+        let out_channels = self.read_u32() as usize;
+
+        // Read scales (f32 × out_channels)
+        let scales: Vec<f32> = {
+            let bytes = self.read_bytes(out_channels * 4);
+            bytes.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+
+        // Read int8 data
+        let int8_bytes = self.read_bytes(num_elements);
+        // Pad to 4-byte alignment
+        let pad = (4 - (num_elements % 4)) % 4;
+        if pad > 0 { self.read_bytes(pad); }
+
+        // Dequantize: per-channel
+        let mut result = vec![0.0f32; num_elements];
+        if out_channels == 1 {
+            let s = scales[0];
+            for i in 0..num_elements {
+                result[i] = (int8_bytes[i] as i8 as f32) * s;
+            }
+        } else {
+            let per_ch = num_elements / out_channels;
+            for ch in 0..out_channels {
+                let s = scales[ch];
+                let start = ch * per_ch;
+                for i in 0..per_ch {
+                    result[start + i] = (int8_bytes[start + i] as i8 as f32) * s;
+                }
+            }
+        }
         result
     }
+}
+
+/// Convert IEEE 754 half-precision float16 to float32
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) & 1) as u32;
+    let exp = ((h >> 10) & 0x1F) as u32;
+    let mant = (h & 0x3FF) as u32;
+
+    if exp == 0 {
+        if mant == 0 {
+            return f32::from_bits(sign << 31);
+        }
+        // Denorm: convert to normalized f32
+        let mut m = mant;
+        let mut e = 0i32;
+        while m & 0x400 == 0 { m <<= 1; e += 1; }
+        m &= 0x3FF;
+        let f_exp = (127 - 15 + 1 - e) as u32;
+        return f32::from_bits((sign << 31) | (f_exp << 23) | (m << 13));
+    }
+    if exp == 31 {
+        // Inf/NaN
+        return f32::from_bits((sign << 31) | (0xFF << 23) | (mant << 13));
+    }
+    let f_exp = exp + 127 - 15;
+    f32::from_bits((sign << 31) | (f_exp << 23) | (mant << 13))
 }
 
 // ---------------------------------------------------------------------------
