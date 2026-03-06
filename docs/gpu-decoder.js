@@ -164,35 +164,128 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 `;
 
 // ============================================================
-// Weight Layout — matches export_dog_weights.py output order
+// Weight Layout — matches export_dog_weights.py / quantize_dog.py output order
 // ============================================================
 
+const WEIGHT_LAYOUT = [
+    ['fc_w', 8192 * LATENT_DIM], ['fc_b', 8192],
+    ['s1_conv_w', 512*512*9], ['s1_conv_b', 512],
+    ['s1_rb1_w', 512*512*9], ['s1_rb1_b', 512],
+    ['s1_rb2_w', 512*512*9], ['s1_rb2_b', 512],
+    ['s2_conv_w', 512*256*9], ['s2_conv_b', 256],
+    ['s2_rb1_w', 256*256*9], ['s2_rb1_b', 256],
+    ['s2_rb2_w', 256*256*9], ['s2_rb2_b', 256],
+    ['s3_conv_w', 256*128*9], ['s3_conv_b', 128],
+    ['s3_rb1_w', 128*128*9], ['s3_rb1_b', 128],
+    ['s3_rb2_w', 128*128*9], ['s3_rb2_b', 128],
+    ['s4_conv_w', 128*64*9], ['s4_conv_b', 64],
+    ['s4_rb1_w', 64*64*9], ['s4_rb1_b', 64],
+    ['s4_rb2_w', 64*64*9], ['s4_rb2_b', 64],
+    ['s5_conv1_w', 64*32*9], ['s5_conv1_b', 32],
+    ['s5_conv2_w', 32*3*9], ['s5_conv2_b', 3],
+];
+
 function computeWeightOffsets() {
-    const layout = [
-        ['fc_w', 8192 * LATENT_DIM], ['fc_b', 8192],
-        ['s1_conv_w', 512*512*9], ['s1_conv_b', 512],
-        ['s1_rb1_w', 512*512*9], ['s1_rb1_b', 512],
-        ['s1_rb2_w', 512*512*9], ['s1_rb2_b', 512],
-        ['s2_conv_w', 512*256*9], ['s2_conv_b', 256],
-        ['s2_rb1_w', 256*256*9], ['s2_rb1_b', 256],
-        ['s2_rb2_w', 256*256*9], ['s2_rb2_b', 256],
-        ['s3_conv_w', 256*128*9], ['s3_conv_b', 128],
-        ['s3_rb1_w', 128*128*9], ['s3_rb1_b', 128],
-        ['s3_rb2_w', 128*128*9], ['s3_rb2_b', 128],
-        ['s4_conv_w', 128*64*9], ['s4_conv_b', 64],
-        ['s4_rb1_w', 64*64*9], ['s4_rb1_b', 64],
-        ['s4_rb2_w', 64*64*9], ['s4_rb2_b', 64],
-        ['s5_conv1_w', 64*32*9], ['s5_conv1_b', 32],
-        ['s5_conv2_w', 32*3*9], ['s5_conv2_b', 3],
-    ];
     const o = {};
     let off = 0;
-    for (const [name, size] of layout) {
+    for (const [name, size] of WEIGHT_LAYOUT) {
         o[name] = off;
         off += size;
     }
     o._total = off;
     return o;
+}
+
+// ============================================================
+// Weight dequantization — decode fp16/int8 binary to Float32Array
+// ============================================================
+
+const MAGIC = 0x56414551; // 'VAEQ'
+const MODE_FP32 = 0;
+const MODE_FP16 = 1;
+const MODE_INT8 = 2;
+
+function f16ToF32(h) {
+    const sign = (h >> 15) & 1;
+    const exp = (h >> 10) & 0x1F;
+    const mant = h & 0x3FF;
+    if (exp === 0) {
+        if (mant === 0) return sign ? -0 : 0;
+        // Denorm
+        let m = mant, e = 0;
+        while (!(m & 0x400)) { m <<= 1; e++; }
+        m &= 0x3FF;
+        const bits = (sign << 31) | ((127 - 15 + 1 - e) << 23) | (m << 13);
+        return new Float32Array(new Uint32Array([bits]).buffer)[0];
+    }
+    if (exp === 31) {
+        const bits = (sign << 31) | (0xFF << 23) | (mant << 13);
+        return new Float32Array(new Uint32Array([bits]).buffer)[0];
+    }
+    const bits = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+    return new Float32Array(new Uint32Array([bits]).buffer)[0];
+}
+
+/**
+ * Decode quantized binary weights into a single Float32Array of fp32.
+ * Supports: legacy (no header = fp32), VAEQ header with fp32/fp16/int8.
+ * @param {ArrayBuffer} ab
+ * @returns {{ f32: Float32Array, mode: string }}
+ */
+function decodeWeights(ab) {
+    const view = new DataView(ab);
+    let offset = 0;
+    let mode = MODE_FP32;
+
+    // Check header
+    if (ab.byteLength >= 16 && view.getUint32(0, true) === MAGIC) {
+        mode = view.getUint32(8, true);
+        offset = 16;
+    }
+
+    const totalFloats = computeWeightOffsets()._total;
+
+    if (mode === MODE_FP32) {
+        const modeName = offset === 0 ? 'legacy fp32' : 'fp32';
+        const f32 = new Float32Array(ab, offset, totalFloats);
+        return { f32: new Float32Array(f32), mode: modeName };
+    }
+
+    if (mode === MODE_FP16) {
+        const u16 = new Uint16Array(ab, offset, totalFloats);
+        const f32 = new Float32Array(totalFloats);
+        for (let i = 0; i < totalFloats; i++) f32[i] = f16ToF32(u16[i]);
+        return { f32, mode: 'fp16' };
+    }
+
+    if (mode === MODE_INT8) {
+        const f32 = new Float32Array(totalFloats);
+        let f32Off = 0;
+        const numTensors = view.getUint32(12, true);
+        for (let t = 0; t < numTensors; t++) {
+            const numElements = view.getUint32(offset, true); offset += 4;
+            const outChannels = view.getUint32(offset, true); offset += 4;
+            // Read scales
+            const scales = new Float32Array(outChannels);
+            for (let c = 0; c < outChannels; c++) {
+                scales[c] = view.getFloat32(offset, true); offset += 4;
+            }
+            // Read int8 data
+            const perCh = numElements / outChannels;
+            for (let c = 0; c < outChannels; c++) {
+                const s = scales[c];
+                for (let i = 0; i < perCh; i++) {
+                    f32[f32Off++] = (view.getInt8(offset++) ) * s;
+                }
+            }
+            // Pad to 4
+            const pad = (4 - (numElements % 4)) % 4;
+            offset += pad;
+        }
+        return { f32, mode: 'int8' };
+    }
+
+    throw new Error(`Unknown weight mode ${mode}`);
 }
 
 // ============================================================
@@ -202,7 +295,7 @@ function computeWeightOffsets() {
 export class GPUDecoder {
     /**
      * Factory: create and initialise a GPU-accelerated decoder.
-     * @param {ArrayBuffer} weightsAB - raw binary weights from export_dog_weights.py
+     * @param {ArrayBuffer} weightsAB - raw binary weights (fp32/fp16/int8 with VAEQ header)
      * @returns {Promise<GPUDecoder>}
      */
     static async create(weightsAB) {
@@ -210,7 +303,11 @@ export class GPUDecoder {
         const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
         if (!adapter) throw new Error('No WebGPU adapter found');
 
-        const needed = weightsAB.byteLength;
+        // Dequantize weights to fp32 on CPU
+        const { f32, mode } = decodeWeights(weightsAB);
+        console.log(`GPU decoder: decoded ${mode} weights → ${f32.length} fp32 floats (${(f32.byteLength / 1024 / 1024).toFixed(1)} MB)`);
+
+        const needed = f32.byteLength;
         const device = await adapter.requestDevice({
             requiredLimits: {
                 maxStorageBufferBindingSize: Math.min(needed, adapter.limits.maxStorageBufferBindingSize),
@@ -224,21 +321,22 @@ export class GPUDecoder {
 
         const dec = new GPUDecoder();
         dec.device = device;
-        dec._initBuffers(weightsAB);
+        dec.weightMode = mode;
+        dec._initBuffers(f32);
         dec._initPipelines();
         dec._buildPlan();
         return dec;
     }
 
     // ---- Buffer creation ----
-    _initBuffers(weightsAB) {
+    _initBuffers(weightsF32) {
         const d = this.device;
         const S = GPUBufferUsage.STORAGE;
         const SCD = S | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
 
-        // Weights (upload at creation)
-        this.weightsBuf = d.createBuffer({ size: weightsAB.byteLength, usage: S, mappedAtCreation: true });
-        new Uint8Array(this.weightsBuf.getMappedRange()).set(new Uint8Array(weightsAB));
+        // Weights (upload fp32 at creation)
+        this.weightsBuf = d.createBuffer({ size: weightsF32.byteLength, usage: S, mappedAtCreation: true });
+        new Float32Array(this.weightsBuf.getMappedRange()).set(weightsF32);
         this.weightsBuf.unmap();
 
         // Intermediates (ping-pong + residual)

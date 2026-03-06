@@ -143,6 +143,33 @@
         }
         .mode-panel { display: none; }
         .mode-panel.active { display: flex; flex-direction: column; gap: 12px; }
+        .preview-row {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            align-items: center;
+        }
+        .preview-item {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 4px;
+        }
+        .preview-item span {
+            font-size: 0.7rem;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .preview-canvas {
+            border: 1px solid #333;
+            border-radius: 4px;
+            background: #1a1a2e;
+            display: block;
+            width: 112px;
+            height: 112px;
+            image-rendering: auto;
+        }
     </style>
 </head>
 <body>
@@ -184,6 +211,16 @@
                     <button id="btn-interp-a">New A</button>
                     <button id="btn-interp-b">New B</button>
                     <button id="btn-interp-both">New Both</button>
+                </div>
+                <div class="preview-row">
+                    <div class="preview-item">
+                        <span>A</span>
+                        <canvas id="preview-a" class="preview-canvas" width="128" height="128"></canvas>
+                    </div>
+                    <div class="preview-item">
+                        <span>B</span>
+                        <canvas id="preview-b" class="preview-canvas" width="128" height="128"></canvas>
+                    </div>
                 </div>
                 <p class="section-label">Slerp between two random samples</p>
                 <div class="interpolation-row">
@@ -366,17 +403,38 @@
             document.getElementById('val-lerp').textContent = parseFloat(sliderLerp.value).toFixed(2);
             scheduleGeneration();
         });
-        document.getElementById('btn-interp-a').addEventListener('click', () => {
+        const previewCtxA = document.getElementById('preview-a').getContext('2d');
+        const previewCtxB = document.getElementById('preview-b').getContext('2d');
+
+        async function renderPreview(z, previewCtx) {
+            if (!decoder) return;
+            try {
+                const rgba = await decoder.generate(z);
+                const img = previewCtx.createImageData(IMG_SIZE, IMG_SIZE);
+                img.data.set(rgba);
+                previewCtx.putImageData(img, 0, 0);
+            } catch (e) { console.warn('Preview render failed:', e); }
+        }
+
+        async function renderPreviews() {
+            await renderPreview(interpA, previewCtxA);
+            await renderPreview(interpB, previewCtxB);
+        }
+
+        document.getElementById('btn-interp-a').addEventListener('click', async () => {
             interpA = randomLatent();
+            await renderPreview(interpA, previewCtxA);
             scheduleGeneration();
         });
-        document.getElementById('btn-interp-b').addEventListener('click', () => {
+        document.getElementById('btn-interp-b').addEventListener('click', async () => {
             interpB = randomLatent();
+            await renderPreview(interpB, previewCtxB);
             scheduleGeneration();
         });
-        document.getElementById('btn-interp-both').addEventListener('click', () => {
+        document.getElementById('btn-interp-both').addEventListener('click', async () => {
             interpA = randomLatent();
             interpB = randomLatent();
+            await renderPreviews();
             scheduleGeneration();
         });
 
@@ -385,7 +443,7 @@
             try {
                 // Fetch weights
                 statusEl.textContent = 'Loading weights…';
-                const resp = await fetch('weights.bin');
+                const resp = await fetch('weight_dog_fp16.bin');
                 if (!resp.ok) throw new Error(`HTTP ${resp.status} — place weights.bin in this directory`);
                 const weightsAB = await resp.arrayBuffer();
                 const sizeMB = (weightsAB.byteLength / 1024 / 1024).toFixed(1);
@@ -430,6 +488,7 @@
 
                 statusEl.textContent = `Ready (${backend})`;
                 statusEl.className = 'ok';
+                await renderPreviews();
                 scheduleGeneration();
             } catch (e) {
                 statusEl.textContent = `Failed: ${e.message}`;

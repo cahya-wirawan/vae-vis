@@ -417,10 +417,8 @@
         }
 
         async function renderPreviews() {
-            await Promise.all([
-                renderPreview(interpA, previewCtxA),
-                renderPreview(interpB, previewCtxB),
-            ]);
+            await renderPreview(interpA, previewCtxA);
+            await renderPreview(interpB, previewCtxB);
         }
 
         document.getElementById('btn-interp-a').addEventListener('click', async () => {
@@ -445,7 +443,7 @@
             try {
                 // Fetch weights
                 statusEl.textContent = 'Loading weights…';
-                const resp = await fetch('weights.bin');
+                const resp = await fetch('weight_dog_fp16.bin');
                 if (!resp.ok) throw new Error(`HTTP ${resp.status} — place weights.bin in this directory`);
                 const weightsAB = await resp.arrayBuffer();
                 const sizeMB = (weightsAB.byteLength / 1024 / 1024).toFixed(1);
