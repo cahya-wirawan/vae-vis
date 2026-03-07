@@ -170,6 +170,18 @@
             height: 112px;
             image-rendering: auto;
         }
+        .footer {
+            margin-top: 32px;
+            font-size: 0.75rem;
+            color: #555;
+        }
+        .footer a {
+            color: #5588cc;
+            text-decoration: none;
+        }
+        .footer a:hover {
+            text-decoration: underline;
+        }
     </style>
 </head>
 <body>
@@ -236,6 +248,7 @@
     </div>
 
     <p id="status">Loading…</p>
+    <p class="footer">Source code on <a href="https://github.com/cahya-wirawan/vae-vis" target="_blank" rel="noopener">https://github.com/cahya-wirawan/vae-vis</a></p>
 
     <script type="module">
         import { GPUDecoder } from './gpu-decoder.js';
