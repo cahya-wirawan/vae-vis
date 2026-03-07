@@ -182,6 +182,37 @@
         .footer a:hover {
             text-decoration: underline;
         }
+        .webgpu-hint {
+            display: none;
+            margin-top: 16px;
+            padding: 12px 16px;
+            background: #1a1a2e;
+            border: 1px solid #333;
+            border-radius: 6px;
+            font-size: 0.78rem;
+            color: #aaa;
+            max-width: 520px;
+            line-height: 1.5;
+        }
+        .webgpu-hint summary {
+            cursor: pointer;
+            color: #cc8844;
+            font-weight: 500;
+            font-size: 0.82rem;
+        }
+        .webgpu-hint summary:hover { color: #ddaa66; }
+        .webgpu-hint ul {
+            margin: 8px 0 0 18px;
+            padding: 0;
+        }
+        .webgpu-hint li { margin-bottom: 4px; }
+        .webgpu-hint code {
+            background: #252540;
+            padding: 1px 5px;
+            border-radius: 3px;
+            font-size: 0.75rem;
+            color: #7eb8ff;
+        }
     </style>
 </head>
 <body>
@@ -248,6 +279,15 @@
     </div>
 
     <p id="status">Loading…</p>
+    <details class="webgpu-hint" id="webgpu-hint">
+        <summary>WebGPU not available — running on CPU (slower)</summary>
+        <p style="margin-top:8px;">To enable WebGPU for GPU-accelerated inference:</p>
+        <ul>
+            <li><strong>Chrome / Edge</strong>: Navigate to <code>chrome://flags</code>, search for <strong>WebGPU</strong>, set to <em>Enabled</em>, and relaunch.</li>
+            <li><strong>Safari 18+</strong>: Go to <em>Settings → Feature Flags</em> (or <em>Develop → Feature Flags</em>), enable <strong>WebGPU</strong>.</li>
+            <li><strong>Firefox Nightly</strong>: Navigate to <code>about:config</code>, set <code>dom.webgpu.enabled</code> to <strong>true</strong>, and restart.</li>
+        </ul>
+    </details>
     <p class="footer">Source code on <a href="https://github.com/cahya-wirawan/vae-vis" target="_blank" rel="noopener">https://github.com/cahya-wirawan/vae-vis</a></p>
 
     <script type="module">
@@ -488,6 +528,7 @@
                     };
                     backend = 'WASM (CPU)';
                     console.log('Using WASM CPU fallback');
+                    document.getElementById('webgpu-hint').style.display = 'block';
                 }
 
                 subtitleEl.textContent = `128×128 ResNet-style VAE · ${backend} · latent dim = 256`;
