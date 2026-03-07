@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AFHQ VAE Decoder</title>
+    <title>Cats VAE Decoder</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -173,7 +173,7 @@
     </style>
 </head>
 <body>
-    <h1>AFHQ VAE Decoder</h1>
+    <h1>Cats VAE Decoder</h1>
     <p class="subtitle" id="subtitle">128×128 ResNet-style VAE · latent dim = 256</p>
 
     <div class="main">
@@ -443,7 +443,7 @@
             try {
                 // Fetch weights
                 statusEl.textContent = 'Loading weights…';
-                const resp = await fetch('weight_dog_fp16.bin');
+                const resp = await fetch('weight_dog_int8.bin');
                 if (!resp.ok) throw new Error(`HTTP ${resp.status} — place weights.bin in this directory`);
                 const weightsAB = await resp.arrayBuffer();
                 const sizeMB = (weightsAB.byteLength / 1024 / 1024).toFixed(1);
