@@ -54,6 +54,51 @@ class VGGPerceptualLoss(nn.Module):
 
 
 # ==========================================
+# 1b. SSIM Loss
+# ==========================================
+class SSIMLoss(nn.Module):
+    """Structural Similarity Index loss.
+    Returns 1 - SSIM so it can be minimized.
+    Operates on RGB images in [0, 1]."""
+
+    def __init__(self, window_size=11, sigma=1.5, channels=3):
+        super().__init__()
+        self.window_size = window_size
+        self.channels = channels
+        self.C1 = 0.01 ** 2  # (k1 * L)^2 with L=1
+        self.C2 = 0.03 ** 2  # (k2 * L)^2 with L=1
+        # Create Gaussian kernel
+        kernel_1d = self._gaussian_kernel_1d(window_size, sigma)
+        kernel_2d = kernel_1d.unsqueeze(1) * kernel_1d.unsqueeze(0)
+        kernel_2d = kernel_2d.expand(channels, 1, window_size, window_size).contiguous()
+        self.register_buffer("window", kernel_2d)
+
+    @staticmethod
+    def _gaussian_kernel_1d(size, sigma):
+        coords = torch.arange(size, dtype=torch.float32) - size // 2
+        g = torch.exp(-coords ** 2 / (2 * sigma ** 2))
+        return g / g.sum()
+
+    def forward(self, pred, target):
+        pad = self.window_size // 2
+        mu_pred = nn.functional.conv2d(pred, self.window, padding=pad, groups=self.channels)
+        mu_target = nn.functional.conv2d(target, self.window, padding=pad, groups=self.channels)
+
+        mu_pred_sq = mu_pred ** 2
+        mu_target_sq = mu_target ** 2
+        mu_cross = mu_pred * mu_target
+
+        sigma_pred_sq = nn.functional.conv2d(pred ** 2, self.window, padding=pad, groups=self.channels) - mu_pred_sq
+        sigma_target_sq = nn.functional.conv2d(target ** 2, self.window, padding=pad, groups=self.channels) - mu_target_sq
+        sigma_cross = nn.functional.conv2d(pred * target, self.window, padding=pad, groups=self.channels) - mu_cross
+
+        ssim_map = ((2 * mu_cross + self.C1) * (2 * sigma_cross + self.C2)) / \
+                   ((mu_pred_sq + mu_target_sq + self.C1) * (sigma_pred_sq + sigma_target_sq + self.C2))
+
+        return 1.0 - ssim_map.mean()
+
+
+# ==========================================
 # 2. VAE Architecture (ResNet-style, no skip connections)
 # ==========================================
 class ResBlock(nn.Module):
@@ -213,19 +258,21 @@ class VAE(nn.Module):
 # ==========================================
 # 3. Loss Function
 # ==========================================
-def vae_loss(reconstructed_x, x, mu, logvar, perceptual_fn, kl_weight=1.0):
+def vae_loss(reconstructed_x, x, mu, logvar, perceptual_fn, ssim_fn=None, kl_weight=1.0, ssim_weight=0.5):
     # L1 loss: sharper than MSE
     L1 = nn.functional.l1_loss(reconstructed_x, x, reduction="mean")
     # Perceptual loss
     P_LOSS = perceptual_fn(reconstructed_x, x)
+    # SSIM loss
+    S_LOSS = ssim_fn(reconstructed_x, x) if ssim_fn is not None else torch.tensor(0.0)
     # KL Divergence
     logvar_safe = torch.clamp(logvar, min=-10.0, max=10.0)
     KLD = -0.5 * torch.mean(
         torch.sum(1 + logvar_safe - mu.pow(2) - logvar_safe.exp(), dim=1)
     )
-    recon_loss = L1 + 0.5 * P_LOSS
+    recon_loss = L1 + 0.5 * P_LOSS + ssim_weight * S_LOSS
     total = recon_loss + kl_weight * KLD
-    return total, L1.item(), P_LOSS.item(), KLD.item()
+    return total, L1.item(), P_LOSS.item(), S_LOSS.item(), KLD.item()
 
 
 # ==========================================
@@ -277,6 +324,7 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4, help="Number of worker processes for data loading")
     parser.add_argument("--kl_weight_max", type=float, default=0.0001, help="Max KL divergence weight")
     parser.add_argument("--kl_warmup_epochs", type=int, default=30, help="Epochs for KL weight warmup")
+    parser.add_argument("--ssim_weight", type=float, default=0.5, help="Weight for SSIM loss (0 to disable)")
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory path (default: output/run_timestamp)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -358,6 +406,7 @@ def main():
     # Initialize Model, Loss, Optimizer
     model = VAE(args.latent_dim).to(device)
     perceptual_loss_fn = VGGPerceptualLoss().to(device)
+    ssim_loss_fn = SSIMLoss().to(device) if args.ssim_weight > 0 else None
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
@@ -397,6 +446,7 @@ def main():
         train_loss = 0
         train_l1 = 0
         train_perc = 0
+        train_ssim = 0
         train_kld = 0
         num_batches = 0
 
@@ -412,8 +462,9 @@ def main():
             optimizer.zero_grad()
             reconstructed_batch, mu, logvar = model(data)
 
-            loss, l1_val, perc_val, kld_val = vae_loss(
-                reconstructed_batch, data, mu, logvar, perceptual_loss_fn, kl_weight
+            loss, l1_val, perc_val, ssim_val, kld_val = vae_loss(
+                reconstructed_batch, data, mu, logvar, perceptual_loss_fn,
+                ssim_loss_fn, kl_weight, args.ssim_weight
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -421,6 +472,7 @@ def main():
             train_loss += loss.item()
             train_l1 += l1_val
             train_perc += perc_val
+            train_ssim += ssim_val
             train_kld += kld_val
             num_batches += 1
             optimizer.step()
@@ -430,6 +482,7 @@ def main():
         avg_loss = train_loss / num_batches
         avg_l1 = train_l1 / num_batches
         avg_perc = train_perc / num_batches
+        avg_ssim = train_ssim / num_batches
         avg_kld = train_kld / num_batches
         current_lr = scheduler.get_last_lr()[0]
 
@@ -437,6 +490,7 @@ def main():
         writer.add_scalar("Loss/Total", avg_loss, epoch + 1)
         writer.add_scalar("Loss/L1", avg_l1, epoch + 1)
         writer.add_scalar("Loss/Perceptual", avg_perc, epoch + 1)
+        writer.add_scalar("Loss/SSIM", avg_ssim, epoch + 1)
         writer.add_scalar("Loss/KLD", avg_kld, epoch + 1)
         writer.add_scalar("Meta/KL_Weight", kl_weight, epoch + 1)
         writer.add_scalar("Meta/LR", current_lr, epoch + 1)
@@ -448,6 +502,7 @@ def main():
                 "loss/total": avg_loss,
                 "loss/l1": avg_l1,
                 "loss/perceptual": avg_perc,
+                "loss/ssim": avg_ssim,
                 "loss/kld": avg_kld,
                 "meta/kl_weight": kl_weight,
                 "meta/lr": current_lr,
@@ -456,7 +511,7 @@ def main():
         if (epoch + 1) % 5 == 0:
             print(
                 f"Epoch [{epoch+1}/{args.epochs}] - Loss: {avg_loss:.6f} | "
-                f"L1: {avg_l1:.6f} | Perc: {avg_perc:.4f} | KLD: {avg_kld:.4f} | "
+                f"L1: {avg_l1:.6f} | Perc: {avg_perc:.4f} | SSIM: {avg_ssim:.4f} | KLD: {avg_kld:.4f} | "
                 f"KL_w: {kl_weight:.5f} | LR: {current_lr:.2e}"
             )
 
