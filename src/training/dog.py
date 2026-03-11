@@ -370,8 +370,8 @@ class VAELightningModule(L.LightningModule):
 # ==========================================
 # 6. Lightning DataModule
 # ==========================================
-class AFHQDataModule(L.LightningDataModule):
-    def __init__(self, img_size=128, batch_size=196, num_workers=4):
+class HuggingFaceImageDataModule(L.LightningDataModule):
+    def __init__(self, dataset_name="huggan/AFHQ", image_column="image", img_size=128, batch_size=196, num_workers=4):
         super().__init__()
         self.save_hyperparameters()
         self.dataset = None
@@ -386,15 +386,17 @@ class AFHQDataModule(L.LightningDataModule):
             ]
         )
 
+        image_col = self.hparams.image_column
+
         def transform_fn(examples):
             examples["pixel_values"] = [
-                transform(image.convert("RGB")) for image in examples["image"]
+                transform(image.convert("RGB")) for image in examples[image_col]
             ]
-            del examples["image"]
+            del examples[image_col]
             return examples
 
-        print("Loading huggan/AFHQ dataset...")
-        self.dataset = load_dataset("huggan/AFHQ", split="train")
+        print(f"Loading {self.hparams.dataset_name} dataset...")
+        self.dataset = load_dataset(self.hparams.dataset_name, split="train")
         self.dataset.set_transform(transform_fn)
         print(f"Dataset size: {len(self.dataset)} images")
 
@@ -423,6 +425,10 @@ def main():
     parser.add_argument("--latent_dim", type=int, default=256)
     parser.add_argument("--img_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--dataset", type=str, default="huggan/AFHQ",
+                        help="HuggingFace dataset name (default: huggan/AFHQ)")
+    parser.add_argument("--image_column", type=str, default="image",
+                        help="Column name containing images in the dataset (default: image)")
     parser.add_argument("--kl_weight_max", type=float, default=0.001)
     parser.add_argument("--kl_warmup_epochs", type=int, default=30)
     parser.add_argument("--output_dir", type=str, default=None)
@@ -514,7 +520,9 @@ def main():
         epochs=args.epochs,
         sample_dir=sample_dir,
     )
-    data_module = AFHQDataModule(
+    data_module = HuggingFaceImageDataModule(
+        dataset_name=args.dataset,
+        image_column=args.image_column,
         img_size=args.img_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
