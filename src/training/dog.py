@@ -281,7 +281,7 @@ def vae_loss(reconstructed_x, x, mu, logvar, perceptual_fn, kl_weight=1.0, ssim_
 # 5. Lightning Module
 # ==========================================
 class VAELightningModule(L.LightningModule):
-    def __init__(self, latent_dim=256, lr=2e-4, kl_weight_max=0.0001,
+    def __init__(self, latent_dim=256, lr=2e-4, kl_weight_max=0.001,
                  kl_warmup_epochs=30, epochs=500, sample_dir="samples"):
         super().__init__()
         self.save_hyperparameters()
@@ -423,7 +423,7 @@ def main():
     parser.add_argument("--latent_dim", type=int, default=256)
     parser.add_argument("--img_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--kl_weight_max", type=float, default=0.0001)
+    parser.add_argument("--kl_weight_max", type=float, default=0.001)
     parser.add_argument("--kl_warmup_epochs", type=int, default=30)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument(
