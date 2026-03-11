@@ -371,20 +371,23 @@ class VAELightningModule(L.LightningModule):
 # 6. Lightning DataModule
 # ==========================================
 class HuggingFaceImageDataModule(L.LightningDataModule):
-    def __init__(self, dataset_name="huggan/AFHQ", image_column="image", img_size=128, batch_size=196, num_workers=4):
+    def __init__(self, dataset_name="huggan/AFHQ", image_column="image", img_size=128, batch_size=196, num_workers=4, grayscale=False):
         super().__init__()
         self.save_hyperparameters()
         self.dataset = None
 
     def setup(self, stage=None):
-        transform = transforms.Compose(
-            [
-                transforms.Resize((self.hparams.img_size, self.hparams.img_size)),
+        # Build transforms - skip flip and color jitter for grayscale datasets
+        transform_list = [
+            transforms.Resize((self.hparams.img_size, self.hparams.img_size)),
+        ]
+        if not self.hparams.grayscale:
+            transform_list.extend([
                 transforms.RandomHorizontalFlip(),
                 transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
-                transforms.ToTensor(),
-            ]
-        )
+            ])
+        transform_list.append(transforms.ToTensor())
+        transform = transforms.Compose(transform_list)
 
         image_col = self.hparams.image_column
 
@@ -429,6 +432,8 @@ def main():
                         help="HuggingFace dataset name (default: huggan/AFHQ)")
     parser.add_argument("--image_column", type=str, default="image",
                         help="Column name containing images in the dataset (default: image)")
+    parser.add_argument("--grayscale", action="store_true",
+                        help="Disable augmentations unsuitable for grayscale datasets (e.g., MNIST)")
     parser.add_argument("--kl_weight_max", type=float, default=0.001)
     parser.add_argument("--kl_warmup_epochs", type=int, default=30)
     parser.add_argument("--output_dir", type=str, default=None)
@@ -526,6 +531,7 @@ def main():
         img_size=args.img_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        grayscale=args.grayscale,
     )
 
     total_params = sum(p.numel() for p in vae_module.model.parameters())
