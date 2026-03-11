@@ -15,6 +15,11 @@ import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 
+try:
+    import wandb
+except ImportError:  # Optional dependency unless --use_wandb is enabled.
+    wandb = None
+
 # ==========================================
 # 1. Perceptual Loss (VGG Feature Matching)
 # ==========================================
@@ -273,6 +278,17 @@ class VAELightningModule(L.LightningModule):
         if (self.current_epoch + 1) % 25 == 0 and self.viz_batch is not None:
             self._save_samples()
 
+    def _log_image_to_loggers(self, tag, image_tensor, step):
+        loggers = []
+        if self.trainer is not None:
+            loggers = self.trainer.loggers or []
+
+        for logger in loggers:
+            if isinstance(logger, TensorBoardLogger):
+                logger.experiment.add_image(tag, image_tensor, step)
+            elif isinstance(logger, WandbLogger) and wandb is not None:
+                logger.experiment.log({tag: [wandb.Image(image_tensor)]}, step=step)
+
     @torch.no_grad()
     def _save_samples(self):
         self.model.eval()
@@ -286,26 +302,16 @@ class VAELightningModule(L.LightningModule):
         comparison = torch.cat([viz, recon], dim=0)
         recon_path = os.path.join(sample_dir, f"recon_epoch_{epoch+1:03d}.png")
         save_image(comparison, recon_path, nrow=8)
-
-        if self.logger:
-            grid = make_grid(comparison, nrow=8)
-            if hasattr(self.logger, "experiment") and hasattr(
-                self.logger.experiment, "add_image"
-            ):
-                self.logger.experiment.add_image("Reconstruction", grid, epoch + 1)
+        grid = make_grid(comparison, nrow=8)
+        self._log_image_to_loggers("Reconstruction", grid, epoch + 1)
 
         # Generate from random latent vectors
         z = torch.randn(8, self.hparams.latent_dim, device=self.device)
         generated = self.model.decode(z)
         gen_path = os.path.join(sample_dir, f"gen_epoch_{epoch+1:03d}.png")
         save_image(generated, gen_path, nrow=8)
-
-        if self.logger:
-            grid_gen = make_grid(generated, nrow=8)
-            if hasattr(self.logger, "experiment") and hasattr(
-                self.logger.experiment, "add_image"
-            ):
-                self.logger.experiment.add_image("Generation", grid_gen, epoch + 1)
+        grid_gen = make_grid(generated, nrow=8)
+        self._log_image_to_loggers("Generation", grid_gen, epoch + 1)
 
         self.model.train()
 
