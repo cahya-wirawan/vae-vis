@@ -20,8 +20,49 @@ try:
 except ImportError:  # Optional dependency unless --use_wandb is enabled.
     wandb = None
 
+
 # ==========================================
-# 1. Perceptual Loss (VGG Feature Matching)
+# 1. SSIM Loss
+# ==========================================
+def gaussian_kernel(window_size: int, sigma: float, channels: int):
+    """Create a 2D Gaussian kernel for SSIM."""
+    coords = torch.arange(window_size, dtype=torch.float32) - window_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g /= g.sum()
+    kernel_1d = g.unsqueeze(1)
+    kernel_2d = kernel_1d @ kernel_1d.t()
+    kernel = kernel_2d.expand(channels, 1, window_size, window_size).contiguous()
+    return kernel
+
+
+def ssim_loss(pred, target, window_size=11, sigma=1.5):
+    """Compute SSIM loss (1 - SSIM) between prediction and target.
+    Returns a value in [0, 1] where 0 means identical images."""
+    channels = pred.shape[1]
+    kernel = gaussian_kernel(window_size, sigma, channels).to(pred.device, pred.dtype)
+
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+
+    mu_pred = nn.functional.conv2d(pred, kernel, padding=window_size // 2, groups=channels)
+    mu_target = nn.functional.conv2d(target, kernel, padding=window_size // 2, groups=channels)
+
+    mu_pred_sq = mu_pred ** 2
+    mu_target_sq = mu_target ** 2
+    mu_pred_target = mu_pred * mu_target
+
+    sigma_pred_sq = nn.functional.conv2d(pred ** 2, kernel, padding=window_size // 2, groups=channels) - mu_pred_sq
+    sigma_target_sq = nn.functional.conv2d(target ** 2, kernel, padding=window_size // 2, groups=channels) - mu_target_sq
+    sigma_pred_target = nn.functional.conv2d(pred * target, kernel, padding=window_size // 2, groups=channels) - mu_pred_target
+
+    ssim_map = ((2 * mu_pred_target + C1) * (2 * sigma_pred_target + C2)) / \
+               ((mu_pred_sq + mu_target_sq + C1) * (sigma_pred_sq + sigma_target_sq + C2))
+
+    return 1 - ssim_map.mean()
+
+
+# ==========================================
+# 2. Perceptual Loss (VGG Feature Matching)
 # ==========================================
 class VGGPerceptualLoss(nn.Module):
     """Compares VGG19 features between prediction and target.
@@ -60,7 +101,7 @@ class VGGPerceptualLoss(nn.Module):
 
 
 # ==========================================
-# 2. VAE Architecture (ResNet-style, no skip connections)
+# 3. VAE Architecture (ResNet-style, no skip connections)
 # ==========================================
 class ResBlock(nn.Module):
     """Residual block: adds input back to output for better gradient flow."""
@@ -217,25 +258,27 @@ class VAE(nn.Module):
 
 
 # ==========================================
-# 3. Loss Function
+# 4. Loss Function
 # ==========================================
-def vae_loss(reconstructed_x, x, mu, logvar, perceptual_fn, kl_weight=1.0):
+def vae_loss(reconstructed_x, x, mu, logvar, perceptual_fn, kl_weight=1.0, ssim_weight=0.1):
     # L1 loss: sharper than MSE
     L1 = nn.functional.l1_loss(reconstructed_x, x, reduction="mean")
     # Perceptual loss
     P_LOSS = perceptual_fn(reconstructed_x, x)
+    # SSIM loss: structural similarity
+    SSIM = ssim_loss(reconstructed_x, x)
     # KL Divergence
     logvar_safe = torch.clamp(logvar, min=-10.0, max=10.0)
     KLD = -0.5 * torch.mean(
         torch.sum(1 + logvar_safe - mu.pow(2) - logvar_safe.exp(), dim=1)
     )
-    recon_loss = L1 + 0.5 * P_LOSS
+    recon_loss = L1 + 0.5 * P_LOSS + ssim_weight * SSIM
     total = recon_loss + kl_weight * KLD
-    return total, L1, P_LOSS, KLD
+    return total, L1, P_LOSS, SSIM, KLD
 
 
 # ==========================================
-# 4. Lightning Module
+# 5. Lightning Module
 # ==========================================
 class VAELightningModule(L.LightningModule):
     def __init__(self, latent_dim=256, lr=2e-4, kl_weight_max=0.0001,
@@ -262,13 +305,14 @@ class VAELightningModule(L.LightningModule):
             min(1.0, self.current_epoch / max(1, self.hparams.kl_warmup_epochs))
             * self.hparams.kl_weight_max
         )
-        loss, l1, perc, kld = vae_loss(
+        loss, l1, perc, ssim, kld = vae_loss(
             reconstructed, data, mu, logvar, self.perceptual_loss_fn, kl_weight
         )
 
         self.log("loss/total", loss, prog_bar=True, sync_dist=True)
         self.log("loss/l1", l1, sync_dist=True)
         self.log("loss/perceptual", perc, sync_dist=True)
+        self.log("loss/ssim", ssim, sync_dist=True)
         self.log("loss/kld", kld, sync_dist=True)
         self.log("meta/kl_weight", kl_weight, sync_dist=True)
 
@@ -324,7 +368,7 @@ class VAELightningModule(L.LightningModule):
 
 
 # ==========================================
-# 5. Lightning DataModule
+# 6. Lightning DataModule
 # ==========================================
 class AFHQDataModule(L.LightningDataModule):
     def __init__(self, img_size=128, batch_size=196, num_workers=4):
@@ -367,7 +411,7 @@ class AFHQDataModule(L.LightningDataModule):
 
 
 # ==========================================
-# 6. Main
+# 7. Main
 # ==========================================
 def main():
     parser = argparse.ArgumentParser(
