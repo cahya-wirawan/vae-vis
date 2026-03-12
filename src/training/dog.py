@@ -282,7 +282,7 @@ def vae_loss(reconstructed_x, x, mu, logvar, perceptual_fn, kl_weight=1.0, ssim_
 # ==========================================
 class VAELightningModule(L.LightningModule):
     def __init__(self, latent_dim=256, lr=2e-4, kl_weight_max=0.001,
-                 kl_warmup_epochs=30, epochs=500, sample_dir="samples"):
+                 kl_warmup_epochs=30, ssim_weight=0.5, epochs=500, sample_dir="samples"):
         super().__init__()
         self.save_hyperparameters()
         self.model = VAE(latent_dim)
@@ -306,7 +306,8 @@ class VAELightningModule(L.LightningModule):
             * self.hparams.kl_weight_max
         )
         loss, l1, perc, ssim, kld = vae_loss(
-            reconstructed, data, mu, logvar, self.perceptual_loss_fn, kl_weight
+            reconstructed, data, mu, logvar, self.perceptual_loss_fn, kl_weight,
+            ssim_weight=self.hparams.ssim_weight
         )
 
         self.log("loss/total", loss, prog_bar=True, sync_dist=True)
@@ -435,6 +436,8 @@ def main():
     parser.add_argument("--grayscale", action="store_true",
                         help="Disable augmentations unsuitable for grayscale datasets (e.g., MNIST)")
     parser.add_argument("--kl_weight_max", type=float, default=0.001)
+    parser.add_argument("--ssim_weight", type=float, default=0.5,
+                        help="Weight for SSIM loss component (default: 0.5)")
     parser.add_argument("--kl_warmup_epochs", type=int, default=30)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument(
@@ -522,6 +525,7 @@ def main():
         lr=args.lr,
         kl_weight_max=args.kl_weight_max,
         kl_warmup_epochs=args.kl_warmup_epochs,
+        ssim_weight=args.ssim_weight,
         epochs=args.epochs,
         sample_dir=sample_dir,
     )
