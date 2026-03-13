@@ -4,6 +4,7 @@ from datetime import datetime
 
 import lightning as L
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 from datasets import load_dataset
@@ -180,11 +181,12 @@ class Decoder(nn.Module):
 
 
 class VectorQuantizer(nn.Module):
-    def __init__(self, num_embeddings=512, embedding_dim=64, commitment_cost=0.25):
+    def __init__(self, num_embeddings=512, embedding_dim=64, commitment_cost=0.25, use_restart=True):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.commitment_cost = commitment_cost
+        self.use_restart = use_restart
 
         self.embedding = nn.Embedding(num_embeddings, embedding_dim)
         self.embedding.weight.data.uniform_(
@@ -207,6 +209,41 @@ class VectorQuantizer(nn.Module):
             encoding_indices, num_classes=self.num_embeddings
         ).type(flat_z.dtype)
 
+        # Count usage for Dead Code Revival
+        usage = encodings.sum(dim=0)
+        num_restarts = 0
+
+        if self.training and self.use_restart:
+            # Sync usage across GPUs for DDP consistency
+            if dist.is_initialized():
+                dist.all_reduce(usage, op=dist.ReduceOp.SUM)
+            
+            # Identify indices that were never used in this batch
+            dead_indices = (usage == 0).nonzero(as_tuple=True)[0]
+            num_dead = dead_indices.numel()
+            
+            if num_dead > 0:
+                # Limit restarts to the available vectors in flat_z
+                num_to_restart = min(num_dead, flat_z.size(0))
+                dead_indices = dead_indices[:num_to_restart]
+                
+                if dist.is_initialized():
+                    # Synchronized random restart: rank 0 picks and broadcasts
+                    if dist.get_rank() == 0:
+                        indices = torch.randperm(flat_z.size(0), device=flat_z.device)[:num_to_restart]
+                        random_latents = flat_z[indices]
+                    else:
+                        random_latents = torch.empty(num_to_restart, self.embedding_dim, device=flat_z.device)
+                    dist.broadcast(random_latents, src=0)
+                else:
+                    # Local random restart
+                    indices = torch.randperm(flat_z.size(0), device=flat_z.device)[:num_to_restart]
+                    random_latents = flat_z[indices]
+                
+                with torch.no_grad():
+                    self.embedding.weight.data[dead_indices] = random_latents
+                num_restarts = num_to_restart
+
         z_q = encodings @ self.embedding.weight
         z_q = z_q.view(z_e_perm.shape)
 
@@ -223,7 +260,7 @@ class VectorQuantizer(nn.Module):
             -torch.sum(avg_probs * torch.log(avg_probs + 1e-10))
         )
 
-        return z_q, vq_loss, perplexity
+        return z_q, vq_loss, perplexity, num_restarts
 
 
 class VQVAE(nn.Module):
@@ -233,6 +270,7 @@ class VQVAE(nn.Module):
         embedding_dim=64,
         num_embeddings=512,
         commitment_cost=0.25,
+        use_restart=True,
     ):
         super().__init__()
         self.encoder = Encoder(hidden_channels=hidden_channels, embedding_dim=embedding_dim)
@@ -240,14 +278,15 @@ class VQVAE(nn.Module):
             num_embeddings=num_embeddings,
             embedding_dim=embedding_dim,
             commitment_cost=commitment_cost,
+            use_restart=use_restart,
         )
         self.decoder = Decoder(hidden_channels=hidden_channels, embedding_dim=embedding_dim)
 
     def forward(self, x):
         z_e = self.encoder(x)
-        z_q, vq_loss, perplexity = self.quantizer(z_e)
+        z_q, vq_loss, perplexity, num_restarts = self.quantizer(z_e)
         x_hat = self.decoder(z_q)
-        return x_hat, vq_loss, perplexity
+        return x_hat, vq_loss, perplexity, num_restarts
 
 
 # ==========================================
@@ -265,6 +304,7 @@ class VQVAELightningModule(L.LightningModule):
         commitment_cost=0.25,
         perceptual_weight=0.5,
         ssim_weight=0.5,
+        use_restart=True,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -273,6 +313,7 @@ class VQVAELightningModule(L.LightningModule):
             embedding_dim=embedding_dim,
             num_embeddings=num_embeddings,
             commitment_cost=commitment_cost,
+            use_restart=use_restart,
         )
         self.perceptual_loss_fn = VGGPerceptualLoss()
         self.viz_batch = None
@@ -286,7 +327,7 @@ class VQVAELightningModule(L.LightningModule):
         if self.viz_batch is None:
             self.viz_batch = data[:8].clone()
 
-        reconstructed, vq_loss, perplexity = self.model(data)
+        reconstructed, vq_loss, perplexity, num_restarts = self.model(data)
 
         l1 = nn.functional.l1_loss(reconstructed, data, reduction="mean")
         perc = self.perceptual_loss_fn(reconstructed, data)
@@ -301,6 +342,7 @@ class VQVAELightningModule(L.LightningModule):
         self.log("loss/ssim", ssim, sync_dist=True)
         self.log("loss/vq", vq_loss, sync_dist=True)
         self.log("meta/perplexity", perplexity, sync_dist=True)
+        self.log("meta/num_restarts", float(num_restarts), sync_dist=True)
 
         return loss
 
@@ -327,7 +369,7 @@ class VQVAELightningModule(L.LightningModule):
         epoch = self.current_epoch
 
         viz = self.viz_batch.to(self.device)
-        recon, _, _ = self.model(viz)
+        recon, _, _, _ = self.model(viz)
         comparison = torch.cat([viz, recon], dim=0)
         recon_path = os.path.join(sample_dir, f"recon_epoch_{epoch + 1:03d}.png")
         save_image(comparison, recon_path, nrow=8)
@@ -452,6 +494,7 @@ def main():
 
     parser.add_argument("--perceptual_weight", type=float, default=0.5)
     parser.add_argument("--ssim_weight", type=float, default=0.5)
+    parser.add_argument("--no_restart", action="store_false", dest="use_restart")
 
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument(
@@ -544,6 +587,7 @@ def main():
         commitment_cost=args.commitment_cost,
         perceptual_weight=args.perceptual_weight,
         ssim_weight=args.ssim_weight,
+        use_restart=args.use_restart,
     )
     data_module = HuggingFaceImageDataModule(
         dataset_name=args.dataset,
