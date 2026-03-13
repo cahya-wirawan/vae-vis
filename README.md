@@ -17,14 +17,23 @@ A project to visualize and explore the latent space of Variational Autoencoders 
   - **MNIST**: Simple fully-connected decoder, 2D latent space, 28×28 grayscale output.
   - **AFHQ Cats**: ResNet-style decoder with 5 upsampling stages, 256-dim latent space, 128×128 RGB output.
 
+### Training Features
+
+- **PyTorch Lightning**: Scalable training with automatic multi-GPU support (DDP, FSDP)
+- **Multi-Loss Function**: Combines L1, VGG perceptual loss, SSIM, and KL divergence with configurable weights
+- **Flexible Datasets**: Train on any HuggingFace image dataset via `--dataset` argument
+- **Grayscale Mode**: Optimized augmentations for grayscale datasets like MNIST (`--grayscale`)
+- **W&B Integration**: Log metrics and sample images to Weights & Biases (`--use_wandb`)
+- **Mixed Precision**: Support for fp16 and bf16 training (`--precision`)
+
 ## Project Structure
 
 ```
 vae-vis/
 ├── src/
 │   ├── training/                # Model training scripts
-│   │   ├── mnist.py             # Trains the VAE on MNIST dataset
-│   │   └── dog.py               # Trains the ResNet VAE on AFHQ dataset
+│   │   ├── mnist.py             # Legacy MNIST training script
+│   │   └── dog.py               # Unified Lightning trainer (any HF dataset)
 │   ├── python/                  # Python-based exploration and utilities
 │   │   ├── app.py               # Streamlit visualization app (MNIST)
 │   │   ├── dog_app.py           # Streamlit visualization app (AFHQ)
@@ -51,19 +60,74 @@ vae-vis/
 
 ### 1. Training the Model
 
+The unified training script `dog.py` supports any HuggingFace image dataset with PyTorch Lightning.
+
+#### Dependencies
+```bash
+pip install torch torchvision lightning datasets wandb
+```
+
+#### AFHQ Dataset (default)
+```bash
+python src/training/dog.py --latent_dim 256 --epochs 500
+```
+
 #### MNIST Dataset
 ```bash
-python src/training/mnist.py
+python src/training/dog.py \
+    --dataset mnist \
+    --img_size 28 \
+    --latent_dim 64 \
+    --grayscale \
+    --epochs 100
 ```
-This generates `decoder_weights.pth`.
 
-#### AFHQ Cats Dataset
-Requires `datasets`, `torchvision`, and optionally `wandb`:
+#### Multi-GPU Training
 ```bash
-pip install datasets torchvision wandb
-python src/training/dog.py --latent-dim 256
+# Use all available GPUs with DDP
+python src/training/dog.py --gpus -1 --strategy ddp
+
+# Use specific number of GPUs
+python src/training/dog.py --gpus 4 --strategy ddp
+
+# Mixed precision for faster training
+python src/training/dog.py --gpus -1 --precision 16-mixed
 ```
-This generates `dog_vae_256_best.pth`.
+
+#### Custom HuggingFace Dataset
+```bash
+python src/training/dog.py \
+    --dataset "username/my-dataset" \
+    --image_column "img" \
+    --img_size 128
+```
+
+#### Training with W&B Logging
+```bash
+python src/training/dog.py \
+    --use_wandb \
+    --wandb_project my-vae-project \
+    --wandb_run_name experiment-1
+```
+
+#### Full Training Options
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--dataset` | `huggan/AFHQ` | HuggingFace dataset name |
+| `--image_column` | `image` | Column containing images |
+| `--img_size` | `128` | Image resolution |
+| `--latent_dim` | `256` | Latent space dimension |
+| `--batch_size` | `196` | Batch size per GPU |
+| `--epochs` | `500` | Number of training epochs |
+| `--lr` | `2e-4` | Learning rate |
+| `--grayscale` | `false` | Disable flip/color augmentations |
+| `--gpus` | `-1` | Number of GPUs (-1 = all) |
+| `--strategy` | `auto` | DDP, FSDP, or auto |
+| `--precision` | `32` | 32, 16-mixed, or bf16-mixed |
+| `--kl_weight_max` | `0.001` | Maximum KL divergence weight |
+| `--kl_warmup_epochs` | `30` | Epochs to ramp up KL weight |
+| `--use_wandb` | `false` | Enable W&B logging |
+| `--resume` | `None` | Path to checkpoint to resume |
 
 ### 2. Exporting & Quantizing Weights
 
@@ -150,3 +214,14 @@ The active backend is shown in the subtitle and status bar.
    - `to_rgba` — Converts float RGB output to RGBA pixel data
 5. **Weight Quantization**: Supports fp32, fp16, and per-channel symmetric int8 with automatic dequantization on load.
 6. **WASM Fallback**: The same decoder architecture is hand-rolled in Rust with all operations (convolution, upsampling, activations) implemented from scratch.
+
+### Loss Function
+
+The VAE loss combines four components:
+
+$$\mathcal{L} = \mathcal{L}_{L1} + 0.5 \cdot \mathcal{L}_{perceptual} + 0.1 \cdot \mathcal{L}_{SSIM} + \beta \cdot D_{KL}$$
+
+- **L1 Loss**: Pixel-wise reconstruction (sharper than MSE)
+- **Perceptual Loss**: VGG19 feature matching at 4 layers (relu1_2, relu2_2, relu3_4, relu4_4)
+- **SSIM Loss**: Structural similarity for better perceptual quality
+- **KL Divergence**: Regularizes latent space; $\beta$ warms up over `--kl_warmup_epochs`
