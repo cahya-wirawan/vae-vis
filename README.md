@@ -1,8 +1,8 @@
-# VAE Latent Space Explorer (VAE-Vis)
+# VAE Latent Space Explorer (VAE-Explorer)
 
 A project to visualize and explore the latent space of Variational Autoencoders (VAEs) trained on the MNIST and Animal Faces-HQ (AFHQ) datasets. This repository demonstrates how to bridge deep learning models from Python/PyTorch to high-performance web applications using Rust, WebAssembly, and WebGPU.
 
-**Live Demo**: [https://cahya-wirawan.github.io/vae-vis/](https://cahya-wirawan.github.io/vae-vis/)
+**Live Demo**: [https://cahya-wirawan.github.io/vae-explorer/](https://cahya-wirawan.github.io/vae-explorer/)
 
 ## Features
 
@@ -20,7 +20,7 @@ A project to visualize and explore the latent space of Variational Autoencoders 
 ## Project Structure
 
 ```
-vae-vis/
+vae-explorer/
 ├── src/
 │   ├── training/                # Model training scripts
 │   │   ├── mnist.py             # Trains the VAE on MNIST dataset
