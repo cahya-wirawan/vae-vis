@@ -1,13 +1,20 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets, transforms
+from torchvision import transforms
+from torchvision.utils import save_image, make_grid
 from torch.utils.data import DataLoader
+from datasets import load_dataset
 import argparse
 import os
 import random
 import numpy as np
 from datetime import datetime
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 # ==========================================
 # 1. Define the VAE Architecture
@@ -75,10 +82,6 @@ def seed_everything(seed):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
-def seed_worker(worker_id):
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
 
 def main():
     parser = argparse.ArgumentParser(description='VAE MNIST Training')
@@ -88,18 +91,24 @@ def main():
     parser.add_argument('--latent-dim', type=int, default=2, help='Latent space dimension')
     parser.add_argument('--hidden-dim1', type=int, default=256, help='Hidden layer 1 size')
     parser.add_argument('--hidden-dim2', type=int, default=128, help='Hidden layer 2 size')
-    parser.add_argument('--beta', type=float, default=1.0, help='KL weight factor')
+    parser.add_argument('--dataset', type=str, default='mnist',
+                        help='HuggingFace dataset name (default: mnist)')
+    parser.add_argument('--image-column', type=str, default='image',
+                        help='Column name containing images (default: image)')
+    parser.add_argument('--kl-weight-max', type=float, default=1.0, help='Maximum KL weight')
     parser.add_argument('--kl-warmup', type=int, default=5, help='KL warmup epochs')
     parser.add_argument('--output-dir', type=str, default='checkpoints_mnist', help='Output directory')
     parser.add_argument('--num-workers', type=int, default=2, help='DataLoader workers')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--amp', action='store_true', help='Use AMP')
     parser.add_argument('--clip-grad', type=float, default=1.0, help='Gradient clipping')
+    # Logging
+    parser.add_argument('--use-wandb', action='store_true', help='Enable W&B logging')
+    parser.add_argument('--wandb-project', type=str, default='vae-mnist', help='W&B project name')
+    parser.add_argument('--wandb-run-name', type=str, default=None, help='W&B run name')
     args = parser.parse_args()
 
     seed_everything(args.seed)
-    g = torch.Generator()
-    g.manual_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Training on: {device}")
@@ -108,24 +117,50 @@ def main():
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(args.output_dir, f"run_{timestamp}")
+    sample_dir = os.path.join(run_dir, "samples")
     os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(sample_dir, exist_ok=True)
 
-    from torchvision.datasets import MNIST
-    MNIST.mirrors = ["https://ossci-datasets.s3.amazonaws.com/mnist/"]
+    # Initialize W&B
+    if args.use_wandb and wandb is not None:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name or f"run_{timestamp}",
+            config=vars(args),
+        )
+        print("📊 W&B logging enabled")
 
-    transform = transforms.ToTensor()
-    train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+    # Load dataset from HuggingFace
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+    
+    image_col = args.image_column
+    
+    def transform_fn(examples):
+        # Convert images to tensors, handling both grayscale and RGB
+        pixel_values = []
+        for img in examples[image_col]:
+            # Convert to grayscale if needed for MNIST-like datasets
+            if img.mode != 'L':
+                img = img.convert('L')
+            pixel_values.append(transform(img))
+        examples["pixel_values"] = pixel_values
+        return examples
+    
+    print(f"Loading {args.dataset} dataset...")
+    dataset = load_dataset(args.dataset, split="train")
+    dataset.set_transform(transform_fn)
+    print(f"Dataset size: {len(dataset)} images")
     
     train_loader = DataLoader(
-        train_dataset, 
+        dataset, 
         batch_size=args.batch_size, 
         shuffle=True,
         drop_last=True,
         num_workers=args.num_workers,
         persistent_workers=True if args.num_workers > 0 else False,
         pin_memory=True if torch.cuda.is_available() else False,
-        worker_init_fn=seed_worker,
-        generator=g,
         prefetch_factor=2,
     )
 
@@ -133,20 +168,30 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
+    # Store first batch for visualization
+    viz_batch = None
+
     model.train()
     for epoch in range(args.epochs):
         train_loss = 0
         train_bce = 0
         train_kld = 0
-        current_beta = args.beta * min(1.0, epoch / args.kl_warmup) if args.kl_warmup > 0 else args.beta
+        kl_weight = args.kl_weight_max * min(1.0, epoch / args.kl_warmup) if args.kl_warmup > 0 else args.kl_weight_max
 
-        for batch_idx, (data, _) in enumerate(train_loader):
+        for batch_idx, batch in enumerate(train_loader):
+            data = batch["pixel_values"]
+            # Stack list of tensors into batch tensor
+            if isinstance(data, list):
+                data = torch.stack(data)
+            # Store first batch for visualization
+            if viz_batch is None:
+                viz_batch = data[:8].clone()
             data = data.to(device)
             optimizer.zero_grad()
             
             with torch.cuda.amp.autocast(enabled=args.amp):
                 recon, mu, logvar = model(data)
-                loss, bce, kld = vae_loss(recon, data, mu, logvar, beta=current_beta)
+                loss, bce, kld = vae_loss(recon, data, mu, logvar, beta=kl_weight)
             
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -159,7 +204,35 @@ def main():
             train_kld += kld.item()
             
         num_batches = len(train_loader)
-        print(f"Epoch [{epoch+1}/{args.epochs}] - Loss: {train_loss/num_batches:.4f} (BCE: {train_bce/num_batches:.4f}, KLD: {train_kld/num_batches:.4f}) Beta: {current_beta:.3f}")
+        avg_loss = train_loss / num_batches
+        avg_bce = train_bce / num_batches
+        avg_kld = train_kld / num_batches
+        print(f"Epoch [{epoch+1}/{args.epochs}] - Loss: {avg_loss:.4f} (BCE: {avg_bce:.4f}, KLD: {avg_kld:.4f}) KL weight: {kl_weight:.3f}")
+
+        # Log to W&B
+        if args.use_wandb and wandb is not None:
+            log_dict = {
+                "loss/total": avg_loss,
+                "loss/bce": avg_bce,
+                "loss/kld": avg_kld,
+                "meta/kl_weight": kl_weight,
+                "epoch": epoch + 1,
+            }
+            # Log sample reconstructions every 5 epochs
+            if (epoch + 1) % 5 == 0 and viz_batch is not None:
+                model.eval()
+                with torch.no_grad():
+                    viz = viz_batch.to(device)
+                    recon_viz, _, _ = model(viz)
+                    recon_viz = recon_viz.view(-1, 1, 28, 28)
+                    comparison = torch.cat([viz, recon_viz], dim=0)
+                    grid = make_grid(comparison, nrow=8)
+                    # Save locally
+                    save_image(comparison, os.path.join(sample_dir, f"recon_epoch_{epoch+1:03d}.png"), nrow=8)
+                    # Log to W&B
+                    log_dict["Reconstruction"] = wandb.Image(grid)
+                model.train()
+            wandb.log(log_dict, step=epoch + 1)
 
         checkpoint = {
             'epoch': epoch + 1,
@@ -189,6 +262,10 @@ def main():
     
     torch.save(decoder_payload, os.path.join(run_dir, 'decoder_weights.pth'))
     torch.save(decoder_payload, 'decoder_weights.pth')
+    
+    # Finish W&B run
+    if args.use_wandb and wandb is not None:
+        wandb.finish()
     
     print(f"\n✅ Training complete!")
     print(f"📦 Checkpoints saved to: {run_dir}")
